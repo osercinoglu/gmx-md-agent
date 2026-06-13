@@ -1,0 +1,50 @@
+# =============================================================================
+# SkyPilot CLUSTER spec for ONE independent cloud MD replica on Vast.ai.
+# This is a TEMPLATE: run_cloud_replica.sh / poc.sh render @@PLACEHOLDERS@@ and
+# launch the result with `sky launch -c <name> --detach-run`. Do not launch this
+# file directly.
+#
+# Durability is LOCAL, not cloud: the node only computes. The local orchestrator
+# rsync-pulls outputs as stages complete and, on a destroyed node, pushes the
+# saved state back into this workdir and relaunches (recovery is local-driven,
+# which is why there is no `job_recovery:` here and no `file_mounts:` — Vast
+# cannot mount object stores). The node carries NO secrets.
+#
+# `workdir: .` is COPY mode (supported on Vast) and delivers scripts+inputs; on a
+# recovery launch the orchestrator also drops the saved .cpt/.gro/.tpr into it so
+# run_pipeline.sh resumes from the last checkpoint.
+# =============================================================================
+name: @@JOBNAME@@
+
+workdir: .
+
+resources:
+  cloud: vast
+  accelerators: @@ACCEL@@
+  disk_size: @@DISK@@
+  image_id: docker:@@IMAGE@@
+  @@SPOT_LINE@@
+  @@REGION_LINE@@
+  @@MAXCOST_LINE@@
+  # No `ports:` (batch MD, only the SkyPilot SSH gateway is reachable on Vast)
+  # and no `file_mounts:`/`job_recovery:` — durability + recovery are handled by
+  # the local orchestrator over rsync.
+
+envs:
+  REPLICA_TAG: "@@TAG@@"
+  TOTAL_NS: "@@TOTAL_NS@@"
+  STAGE_NS: "@@STAGE_NS@@"
+  CKPT_MIN: "@@CKPT_MIN@@"
+  MAXH_PER_STAGE: "@@MAXH_PER_STAGE@@"
+  GPU_ID: "0"
+  GMX_IMAGE_KIND: "@@IMAGE_KIND@@"
+  GMX_CONDA_SPEC: "@@CONDA_SPEC@@"
+  # extend mode (blank for a normal fresh run)
+  EXTEND_BASE: "@@EXTEND_BASE@@"
+  EXTEND_TO_PS: "@@EXTEND_TO_PS@@"
+
+setup: |
+  bash cloud_node_setup.sh
+
+run: |
+  bash run_pipeline.sh

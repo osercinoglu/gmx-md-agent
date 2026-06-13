@@ -1,0 +1,48 @@
+title                   = PROOF-OF-CONCEPT production (0.3 ns) — identical physics to md_50ns
+; Run parameters
+integrator              = md
+nsteps                  = 300000           ; 0.6 ns at dt=0.002 (2 fs) — POC only (long enough to land a mid-run checkpoint to kill+resume on)
+dt                      = 0.002
+comm-mode               = Linear
+nstcomm                 = 100
+; Output control
+nstxout                 = 0
+nstvout                 = 0
+nstfout                 = 0
+nstenergy               = 1000
+nstlog                  = 1000
+nstxout-compressed      = 2000             ; xtc frame every 4 ps (denser for a short run)
+compressed-x-grps       = System
+; Bond parameters
+continuation            = yes
+constraint_algorithm    = lincs
+constraints             = all-bonds
+lincs_iter              = 1
+lincs_order             = 4
+; Neighborsearching
+cutoff-scheme           = Verlet
+ns_type                 = grid
+nstlist                 = 10
+rcoulomb                = 1.0
+rvdw                    = 1.0
+; Electrostatics
+coulombtype             = PME
+pme_order               = 4
+fourierspacing          = 0.16
+; Temperature coupling
+tcoupl                  = V-rescale
+tc-grps                 = Protein Non-Protein
+tau_t                   = 0.1     0.1
+ref_t                   = 310     310
+; Pressure coupling
+pcoupl                  = C-rescale
+pcoupltype              = isotropic
+tau_p                   = 5.5
+ref_p                   = 1.0
+compressibility         = 4.5e-5
+; PBC
+pbc                     = xyz
+; Dispersion correction
+DispCorr                = EnerPres
+; Velocity generation off (continue from NPT)
+gen_vel                 = no

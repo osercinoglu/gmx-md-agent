@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# per-run state produced by the cloud orchestrator
+**/.cloud_run/
+**/.cloud_state/
+scripts/cloud/cloud.env
+scripts/cloud/cloud_selection.env
+**/*.log

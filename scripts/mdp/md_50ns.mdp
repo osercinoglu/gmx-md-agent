@@ -1,0 +1,48 @@
+title                   = Production - pMHC (50 ns stage, dt=2 fs, no HMR)
+; Run parameters
+integrator              = md
+nsteps                  = 25000000         ; 50 ns at dt=0.002 (2 fs)
+dt                      = 0.002
+comm-mode               = Linear
+nstcomm                 = 100
+; Output control
+nstxout                 = 0
+nstvout                 = 0
+nstfout                 = 0
+nstenergy               = 1000             ; energies every 2 ps
+nstlog                  = 1000             ; log every 2 ps
+nstxout-compressed      = 5000             ; xtc frame every 10 ps
+compressed-x-grps       = System
+; Bond parameters
+continuation            = yes
+constraint_algorithm    = lincs
+constraints             = all-bonds
+lincs_iter              = 1
+lincs_order             = 4
+; Neighborsearching
+cutoff-scheme           = Verlet
+ns_type                 = grid
+nstlist                 = 10
+rcoulomb                = 1.0
+rvdw                    = 1.0
+; Electrostatics
+coulombtype             = PME
+pme_order               = 4
+fourierspacing          = 0.16
+; Temperature coupling
+tcoupl                  = V-rescale
+tc-grps                 = Protein Non-Protein
+tau_t                   = 0.1     0.1
+ref_t                   = 310     310
+; Pressure coupling
+pcoupl                  = C-rescale
+pcoupltype              = isotropic
+tau_p                   = 5.5
+ref_p                   = 1.0
+compressibility         = 4.5e-5
+; PBC
+pbc                     = xyz
+; Dispersion correction
+DispCorr                = EnerPres
+; Velocity generation off (continue from NPT / previous part)
+gen_vel                 = no

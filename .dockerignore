@@ -1,0 +1,8 @@
+.git
+**/.cloud_run
+**/.cloud_state
+**/cloud.env
+**/cloud_selection.env
+**/*.log
+**/__pycache__
+*.pyc
