@@ -39,6 +39,11 @@ envs:
   GPU_ID: "0"
   GMX_IMAGE_KIND: "@@IMAGE_KIND@@"
   GMX_CONDA_SPEC: "@@CONDA_SPEC@@"
+  # inputs (system-agnostic; START_STRUCT blank => node auto-detects a .gro/.pdb)
+  START_STRUCT: "@@START_STRUCT@@"
+  TOP: "@@TOP@@"
+  INDEX: "@@INDEX@@"
+  MAXWARN: "@@MAXWARN@@"
   # extend mode (blank for a normal fresh run)
   EXTEND_BASE: "@@EXTEND_BASE@@"
   EXTEND_TO_PS: "@@EXTEND_TO_PS@@"

@@ -49,21 +49,23 @@ TOTAL_NS="${TOTAL_NS:-750}"; STAGE_NS="${STAGE_NS:-50}"
 CKPT_MIN="${CKPT_MIN:-15}";  SYNC_MIN="${SYNC_MIN:-15}"   # SYNC_MIN = local pull cadence
 MAXH_PER_STAGE="${MAXH_PER_STAGE:-48}"; MAX_RESTARTS="${MAX_RESTARTS:-10}"
 DISK_GB="${DISK_GB:-100}"
-PROD_MDP="${PROD_MDP:-$PREP/mdp/md_50ns.mdp}"
+PROD_MDP="${PROD_MDP:-}"                       # production mdp (required for a fresh run)
+EM_MDP="${EM_MDP:-}"; NVT_MDP="${NVT_MDP:-}"; NPT_MDP="${NPT_MDP:-}"   # optional phases
+START_STRUCT="${START_STRUCT:-}"              # starting structure (auto-detected on node if unset)
+TOP="${TOP:-topol.top}"; INDEX="${INDEX:-index.ndx}"; MAXWARN="${MAXWARN:-1}"
+ANALYSIS="${ANALYSIS:-none}"                  # none | pmhc | <hook path>  (local post-process)
 LOCAL_GMX="${LOCAL_GMX:-}"
 PUSHOVER_DEVICE="${PUSHOVER_DEVICE:-}"
 PUSHOVER_CONFIG="${PUSHOVER_CONFIG:-$HOME/.pushover/pushover-config}"
 GMXCLOUD_ENV="${GMXCLOUD_ENV:-gmxcloud}"   # conda env name for local analysis gmx
 EXT_BASE="${EXT_BASE:-}"; EXT_TO_PS="${EXT_TO_PS:-}"   # set by `extend`; empty for fresh runs
+ANALYZE_SH="$PREP/analyze.sh"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 ok()  { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 say() { printf '\n\033[1m>> %s\033[0m\n' "$*"; }
-
-REQUIRED=(solvated_ions.pdb topol.top
-  topol_Protein_chain_A.itp topol_Protein_chain_B.itp topol_Protein_chain_C.itp
-  posre_Protein_chain_A.itp posre_Protein_chain_B.itp posre_Protein_chain_C.itp
-  index.ndx)
+# Input file types uploaded to the node (system-agnostic GROMACS inputs).
+INPUT_GLOBS=(*.gro *.pdb *.top *.itp *.ndx *.cpt)
 
 resolve_dir() { local d="${1:-$PWD}"; (cd "$d" && pwd); }
 tag_of()      { basename "$1"; }
@@ -266,17 +268,23 @@ stage_workdir() {
     chmod +x "$STAGE/run_pipeline.sh" "$STAGE/cloud_node_setup.sh"
     return 0
   fi
-  for f in "${REQUIRED[@]}"; do cp -p "$REPLICA_DIR/$f" "$STAGE/$f"; done
-  # Carry any already-computed equilibration outputs so the node skips straight
-  # to (or resumes) production — harmless for a fresh run, used by the POC.
-  for f in em.gro nvt.gro nvt.cpt npt.gro npt.cpt; do
-    [ -f "$REPLICA_DIR/$f" ] && cp -p "$REPLICA_DIR/$f" "$STAGE/$f"
-  done
-  cp -p "$PREP/mdp/minim.mdp" "$STAGE/mdp/minim.mdp"
-  cp -p "$PREP/mdp/nvt.mdp"   "$STAGE/mdp/nvt.mdp"
-  cp -p "$PREP/mdp/npt.mdp"   "$STAGE/mdp/npt.mdp"
-  cp -p "$PROD_MDP"           "$STAGE/mdp/md_prod.mdp"
+  # General GROMACS inputs: upload the standard input file types + any local
+  # force-field dirs (e.g. charmm36.ff). Trajectories (*.xtc/*.trr) are NOT
+  # uploaded. Equilibration restart outputs (*.gro/*.cpt) come along via the
+  # globs, letting the node skip/resume finished phases.
+  ( shopt -s nullglob
+    for f in "$REPLICA_DIR"/*.gro "$REPLICA_DIR"/*.pdb "$REPLICA_DIR"/*.top \
+             "$REPLICA_DIR"/*.itp "$REPLICA_DIR"/*.ndx "$REPLICA_DIR"/*.cpt; do
+      cp -p "$f" "$STAGE/"
+    done
+    for d in "$REPLICA_DIR"/*.ff; do [ -d "$d" ] && cp -rp "$d" "$STAGE/"; done )
+  # Phase mdps from env, staged under canonical names (only those provided).
+  [ -n "$EM_MDP" ]  && cp -p "$EM_MDP"  "$STAGE/mdp/em.mdp"
+  [ -n "$NVT_MDP" ] && cp -p "$NVT_MDP" "$STAGE/mdp/nvt.mdp"
+  [ -n "$NPT_MDP" ] && cp -p "$NPT_MDP" "$STAGE/mdp/npt.mdp"
+  cp -p "$PROD_MDP" "$STAGE/mdp/prod.mdp"
   chmod +x "$STAGE/run_pipeline.sh" "$STAGE/cloud_node_setup.sh"
+  return 0
 }
 
 render_yaml() {
@@ -303,6 +311,10 @@ render_yaml() {
       -e "s|@@MAXH_PER_STAGE@@|$MAXH_PER_STAGE|g" \
       -e "s|@@IMAGE_KIND@@|$IMAGE_KIND|g" \
       -e "s|@@CONDA_SPEC@@|$CONDA_SPEC|g" \
+      -e "s|@@START_STRUCT@@|${START_STRUCT:-}|g" \
+      -e "s|@@TOP@@|${TOP}|g" \
+      -e "s|@@INDEX@@|${INDEX}|g" \
+      -e "s|@@MAXWARN@@|${MAXWARN}|g" \
       -e "s|@@EXTEND_BASE@@|${EXT_BASE:-}|g" \
       -e "s|@@EXTEND_TO_PS@@|${EXT_TO_PS:-}|g" \
       "$HERE/gromacs_md.sky.yaml.tmpl" > "$STAGE/gromacs_md.sky.yaml"
@@ -366,53 +378,19 @@ restage_state() {
 run_local_analysis() {
   local REPLICA_DIR="$1" STORE STAGE; STORE="$(store_dir "$REPLICA_DIR")"; STAGE="$(stage_dir "$REPLICA_DIR")"
   ensure_local_gmx
-  local A_MODE="fresh" A_BASE=""
+  local A_BASE=""
   if [ -f "$STAGE/.extend.env" ]; then
     # shellcheck disable=SC1090
-    source "$STAGE/.extend.env"; A_MODE="extend"; A_BASE="$EXTEND_BASE"
+    source "$STAGE/.extend.env"; A_BASE="$EXTEND_BASE"
   fi
-  cp -pf "$REPLICA_DIR/index.ndx" "$STORE/" 2>/dev/null || true
-  cp -pf "$REPLICA_DIR"/topol_Protein_chain_*.itp "$STORE/" 2>/dev/null || true
+  # Bring analysis inputs into the store (best effort): index, any itps,
+  # add_chain_ids.py, and the original .xtc for an extend run.
+  cp -pf "$REPLICA_DIR/$INDEX" "$STORE/" 2>/dev/null || true
+  ( shopt -s nullglob; for f in "$REPLICA_DIR"/*.itp; do cp -pf "$f" "$STORE/"; done )
   cp -pf "$PREP/add_chain_ids.py" "$STORE/" 2>/dev/null || true
-  [ "$A_MODE" = "extend" ] && cp -pf "$REPLICA_DIR/${A_BASE}.xtc" "$STORE/" 2>/dev/null || true
-  local N_STAGES; N_STAGES=$(( TOTAL_NS / STAGE_NS ))
-  ( set -e; cd "$STORE"
-    local LAST_TPR PROD_XTCS TRJCAT_FLAGS=""
-    if [ "$A_MODE" = "extend" ]; then
-      LAST_TPR="$(ls -v md_ext*.tpr 2>/dev/null | tail -1)"
-      [ -n "$LAST_TPR" ] && [ -f "$LAST_TPR" ] || { echo "extend: no md_ext*.tpr in $STORE"; exit 1; }
-      [ -f "${A_BASE}.xtc" ] || { echo "extend: original ${A_BASE}.xtc missing in $STORE"; exit 1; }
-      # original first, then the new chunks in order; trjcat (no -cat) dedups the
-      # boundary overlap and orders by time.
-      PROD_XTCS="${A_BASE}.xtc $(ls -v md_ext*.xtc 2>/dev/null)"
-    else
-      LAST_TPR="$(printf 'md_part%02d.tpr' "$N_STAGES")"
-      [ -f "$LAST_TPR" ] || LAST_TPR="$(ls -v md_part*.tpr 2>/dev/null | tail -1)"
-      [ -n "$LAST_TPR" ] && [ -f "$LAST_TPR" ] || { echo "no production .tpr found in $STORE"; exit 1; }
-      if ls md_part*.part*.xtc >/dev/null 2>&1; then
-        PROD_XTCS=$(ls md_part??.xtc md_part*.part*.xtc 2>/dev/null | sort -uV); TRJCAT_FLAGS=""
-      else
-        PROD_XTCS=$(ls md_part??.xtc 2>/dev/null | sort -V); TRJCAT_FLAGS="-cat"
-      fi
-    fi
-    [ -n "$PROD_XTCS" ] || { echo "no trajectory chunks found in $STORE — nothing to analyze"; exit 1; }
-    echo ">> [$A_MODE] last tpr: $LAST_TPR"
-    echo ">> trjcat of: $PROD_XTCS"
-    [ -f prod.xtc ]        || "$LOCAL_GMX" trjcat -f $PROD_XTCS -o prod.xtc $TRJCAT_FLAGS
-    [ -f prod_whole.xtc ]  || echo 0 | "$LOCAL_GMX" trjconv -s "$LAST_TPR" -f prod.xtc        -o prod_whole.xtc  -pbc whole
-    [ -f prod_nojump.xtc ] || echo 0 | "$LOCAL_GMX" trjconv -s "$LAST_TPR" -f prod_whole.xtc  -o prod_nojump.xtc -pbc nojump
-    [ -f prod_center.xtc ] || printf "1\n0\n" | "$LOCAL_GMX" trjconv -s "$LAST_TPR" -f prod_nojump.xtc -o prod_center.xtc -center -pbc mol -ur compact -n index.ndx
-    [ -f prod_fit.xtc ]    || printf "4\n0\n" | "$LOCAL_GMX" trjconv -s "$LAST_TPR" -f prod_center.xtc -o prod_fit.xtc    -fit rot+trans -n index.ndx
-    [ -f prod_dry.xtc ]    || echo 1 | "$LOCAL_GMX" trjconv -s "$LAST_TPR" -f prod_fit.xtc -o prod_dry.xtc -n index.ndx
-    [ -f prod_ref.pdb ]    || echo 1 | "$LOCAL_GMX" trjconv -s "$LAST_TPR" -f prod_fit.xtc -o prod_ref.pdb  -dump 0          -conect -n index.ndx
-    [ -f prod_last.pdb ]   || echo 1 | "$LOCAL_GMX" trjconv -s "$LAST_TPR" -f prod_fit.xtc -o prod_last.pdb -dump 999999999  -conect -n index.ndx
-    if [ -f topol_Protein_chain_A.itp ] && [ -f topol_Protein_chain_B.itp ] && [ -f topol_Protein_chain_C.itp ]; then
-      python3 add_chain_ids.py prod_ref.pdb  topol_Protein_chain_A.itp topol_Protein_chain_B.itp topol_Protein_chain_C.itp
-      python3 add_chain_ids.py prod_last.pdb topol_Protein_chain_A.itp topol_Protein_chain_B.itp topol_Protein_chain_C.itp
-    else
-      echo ">> NOTE: chain itps absent — skipping chain-ID stamping on prod_ref/last.pdb"
-    fi
-  ) || return 1     # propagate analysis failure (called inside an `if`)
+  [ -n "$A_BASE" ] && cp -pf "$REPLICA_DIR/${A_BASE}.xtc" "$STORE/" 2>/dev/null || true
+  # analyze.sh concatenates chunks -> prod.xtc, then runs ANALYSIS (none|pmhc|hook).
+  ANALYSIS="$ANALYSIS" GMX="$LOCAL_GMX" bash "$ANALYZE_SH" "$STORE" ${A_BASE:+"$A_BASE"} || return 1
   local f
   for f in prod.xtc prod_dry.xtc prod_ref.pdb prod_last.pdb; do
     cp -pf "$STORE/$f" "$REPLICA_DIR/" 2>/dev/null || true
@@ -427,9 +405,13 @@ cmd_launch() {
   echo "Replica folder : $REPLICA_DIR"
   echo "Replica tag    : $TAG     cluster/job: $JOB"
 
-  local f
-  for f in "${REQUIRED[@]}"; do [ -f "$REPLICA_DIR/$f" ] || die "missing required input: $REPLICA_DIR/$f"; done
-  [ -f "$PROD_MDP" ] || die "production mdp not found: $PROD_MDP"
+  [ -f "$REPLICA_DIR/$TOP" ] || die "topology '$TOP' not found in $REPLICA_DIR (set TOP/--top)"
+  [ -n "$PROD_MDP" ] && [ -f "$PROD_MDP" ] || die "production mdp not set/found (set PROD_MDP/--prod-mdp)"
+  if [ -n "$START_STRUCT" ]; then
+    [ -f "$REPLICA_DIR/$START_STRUCT" ] || die "starting structure '$START_STRUCT' not found in $REPLICA_DIR"
+  else
+    ls "$REPLICA_DIR"/*.gro "$REPLICA_DIR"/*.pdb >/dev/null 2>&1 || die "no .gro/.pdb starting structure in $REPLICA_DIR (set START_STRUCT/--struct)"
+  fi
 
   say "Bootstrap (tools + Vast key)"
   ensure_tools

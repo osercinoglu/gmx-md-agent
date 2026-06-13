@@ -1,9 +1,9 @@
-# pmhc-md-agent — containerized GROMACS pMHC MD runner (local + Vast.ai/SkyPilot).
+# gmx-md-agent — containerized GROMACS MD runner (local + Vast.ai/SkyPilot).
 #
 # Base: NVIDIA NGC GROMACS 2024.2 (tuned GPU build). Pulling it requires an NGC
 # login at build time:   docker login nvcr.io   (username '$oauthtoken', NGC API key)
 #
-# Build:  docker build -t pmhc-md-agent .
+# Build:  docker build -t gmx-md-agent .
 # Run:    see README.md  (bind-mount the replica folder at /work)
 FROM nvcr.io/hpc/gromacs:2024.2
 
@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python3 -m pip install --no-cache-dir --upgrade pip \
     && python3 -m pip install --no-cache-dir "skypilot[vast]" vastai
 
-WORKDIR /opt/pmhc-md-agent
+WORKDIR /opt/gmx-md-agent
 COPY mdagent/    ./mdagent/
 COPY scripts/    ./scripts/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -24,7 +24,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh \
     && find ./scripts -name '*.sh' -exec chmod +x {} + \
     && find ./scripts -name '*.py' -exec chmod +x {} +
 
-ENV PYTHONPATH=/opt/pmhc-md-agent \
+ENV PYTHONPATH=/opt/gmx-md-agent \
     PYTHONUNBUFFERED=1
 
 # The replica folder is bind-mounted here at runtime.

@@ -45,7 +45,14 @@ ok(){  printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 bad(){ printf '  \033[31mFAIL\033[0m %s\n' "$*"; PASS=0; }
 
 # POC overrides: 1 ns total in a single 1 ns stage, frequent checkpoints/pulls.
-poc_env() { PROD_MDP="$HERE/mdp/md_poc.mdp" TOTAL_NS=1 STAGE_NS=1 CKPT_MIN=1 SYNC_MIN=1 MAXH_PER_STAGE=2 MAX_RESTARTS=5 "$@"; }
+# Uses the bundled pMHC test system (full phase mdps + pmhc analysis preset);
+# seeded equilibration outputs make those phases skip so production starts from
+# the equilibrated state.
+poc_env() {
+  PROD_MDP="$HERE/mdp/md_poc.mdp" \
+  EM_MDP="$PREP/mdp/minim.mdp" NVT_MDP="$PREP/mdp/nvt.mdp" NPT_MDP="$PREP/mdp/npt.mdp" \
+  ANALYSIS=pmhc TOTAL_NS=1 STAGE_NS=1 CKPT_MIN=1 SYNC_MIN=1 MAXH_PER_STAGE=2 MAX_RESTARTS=5 "$@"
+}
 
 prepare_poc_dir() {
   say "Preparing throwaway POC folder: $POC_DIR (from $POC_SYS)"
