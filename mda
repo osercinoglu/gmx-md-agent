@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# mda — thin host wrapper around `docker run` for the gmx-md-agent image.
+# Runs the agent on the current folder (mounted at /work), auto-adding GPU access
+# when the nvidia container runtime is available and mounting any credentials you
+# already have. Examples:
+#   ./mda local  --prod-mdp prod.mdp --total-ns 500
+#   ./mda cloud  --prod-mdp prod.mdp --gpu-names RTX_4090
+#   ./mda extend --from md_0_250ns --to-ns 750 --where cloud
+#   MDAGENT_DETACH=1 ./mda cloud --prod-mdp prod.mdp   # detach (long cloud runs)
+#
+# Env overrides: MDAGENT_IMAGE (default gmx-md-agent), MDAGENT_WORK (default $PWD),
+#   MDAGENT_GPUS=1 force --gpus all, MDAGENT_GPUS=0 disable, MDAGENT_DETACH=1.
+set -euo pipefail
+IMAGE="${MDAGENT_IMAGE:-gmx-md-agent}"
+WORK="${MDAGENT_WORK:-$PWD}"
+
+# GPU passthrough: explicit env wins; else auto-detect the nvidia docker runtime.
+gpu_args=()
+case "${MDAGENT_GPUS:-auto}" in
+  1) gpu_args=(--gpus all) ;;
+  0) gpu_args=() ;;
+  *) if docker info 2>/dev/null | grep -qiE 'Runtimes:.*nvidia|nvidia'; then gpu_args=(--gpus all); fi ;;
+esac
+
+# Mount the working folder + any credentials/state that exist on the host.
+mounts=(-v "$WORK":/work)
+for pair in \
+  "$HOME/.config/vastai:/root/.config/vastai" \
+  "$HOME/.pushover:/root/.pushover" \
+  "$HOME/.sky:/root/.sky" \
+  "$HOME/.ssh:/root/.ssh"; do
+  [ -e "${pair%%:*}" ] && mounts+=(-v "$pair")
+done
+
+mode=(--rm -it)
+[ "${MDAGENT_DETACH:-0}" = "1" ] && mode=(--rm -d)
+
+exec docker run "${mode[@]}" "${gpu_args[@]}" "${mounts[@]}" "$IMAGE" "$@"

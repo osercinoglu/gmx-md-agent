@@ -32,9 +32,10 @@ Base image = NGC GROMACS 2024.2, so log in to NGC first (username `$oauthtoken`,
 password = your NGC API key):
 
 ```bash
-docker login nvcr.io
 cd ~/repos/gmx-md-agent
-docker build -t gmx-md-agent .
+make login        # docker login nvcr.io
+make build        # docker build -t gmx-md-agent .
+make help         # all targets
 ```
 
 ## Credentials (mounted if present, else env)
@@ -45,11 +46,15 @@ docker build -t gmx-md-agent .
 | Pushover | `~/.pushover` | `PUSHOVER_TOKEN`, `PUSHOVER_USER` |
 | SkyPilot state / SSH | `~/.sky`, `~/.ssh` | — |
 
+The `./mda` wrapper handles all of this automatically: it mounts the current
+folder at `/work`, mounts whichever of the above host configs exist, and adds
+`--gpus all` when the nvidia docker runtime is present. (Set `MDAGENT_GPUS=0/1`
+to force, `MDAGENT_DETACH=1` to detach a long cloud run.) The raw form is just:
+
 ```bash
-alias mdagent='docker run --rm -it -v "$PWD":/work \
+docker run --rm -it -v "$PWD":/work \
   -v ~/.config/vastai:/root/.config/vastai -v ~/.pushover:/root/.pushover \
-  -v ~/.sky:/root/.sky -v ~/.ssh:/root/.ssh gmx-md-agent'
-mdagent_gpu() { docker run --rm -it --gpus all -v "$PWD":/work gmx-md-agent "$@"; }
+  -v ~/.sky:/root/.sky -v ~/.ssh:/root/.ssh gmx-md-agent <args>
 ```
 
 ## Inputs
@@ -66,24 +71,26 @@ production from an already-equilibrated structure, pass only `--prod-mdp`.
 
 ## Run
 
+From a folder containing your inputs, using the `./mda` wrapper:
+
 ```bash
 # local (this machine's GPU; needs nvidia-container-toolkit on the host)
-mdagent_gpu local --struct conf.gro --top topol.top \
+./mda local --struct conf.gro --top topol.top \
   --em-mdp min.mdp --nvt-mdp nvt.mdp --npt-mdp npt.mdp --prod-mdp prod.mdp \
   --total-ns 500 --stage-ns 50
 
 # cloud (Vast.ai)
-mdagent cloud --prod-mdp prod.mdp --total-ns 500 --gpu-names RTX_4090,RTX_3090
+./mda cloud --prod-mdp prod.mdp --total-ns 500 --gpu-names RTX_4090,RTX_3090
 
 # continue an existing run (.tpr + .cpt) to a target ns
-mdagent extend --from md_0_250ns --to-ns 750 --where cloud      # absolute
-mdagent_gpu extend --from md_0_250ns --by-ns 500 --where local  # delta
+./mda extend --from md_0_250ns --to-ns 750 --where cloud      # absolute
+./mda extend --from md_0_250ns --by-ns 500 --where local      # delta
 
 # manage / prove
-mdagent status        # progress bar + vast#<id>
-mdagent follow        # tail supervisor log
-mdagent teardown
-mdagent poc dryrun    # cheap cloud-path proof (uses the bundled pMHC test system)
+./mda status        # progress bar + vast#<id>
+./mda follow        # tail supervisor log
+./mda teardown
+make dryrun         # cheap cloud-path proof (uses the bundled pMHC test system)
 ```
 
 Local GPU passthrough needs the NVIDIA Container Toolkit on the host (one-time):
