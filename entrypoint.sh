@@ -5,12 +5,13 @@ set -euo pipefail
 export LC_ALL=C LANG=C
 : "${HOME:=/root}"
 
-# --- GROMACS on PATH (NGC image) ---
-if ! command -v gmx >/dev/null 2>&1; then
-  for rc in /usr/local/gromacs/bin/GMXRC /usr/local/gromacs/avx2_256/bin/GMXRC /opt/gromacs/bin/GMXRC; do
-    [ -f "$rc" ] && { source "$rc"; break; }
-  done
-fi
+# --- GROMACS on PATH ---
+# This image installs gmx into the conda env /opt/gmx; source its GMXRC (sets
+# GMXDATA etc.). Fall back to common system locations for other base images.
+for rc in /opt/gmx/bin/GMXRC /usr/local/gromacs/bin/GMXRC /opt/gromacs/bin/GMXRC; do
+  [ -f "$rc" ] && { source "$rc"; break; }
+done
+export PATH="/opt/gmx/bin:$PATH"
 
 # --- credentials: env/flags fallback when host configs are NOT mounted ---
 # Vast API key (mounted at ~/.config/vastai/vast_api_key, else from $VAST_API_KEY)

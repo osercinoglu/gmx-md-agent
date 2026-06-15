@@ -9,7 +9,9 @@ It is **system-agnostic**: you bring your own structure, topology, optional
 index, and mdp files. The MD workflow is mdp-driven (EM → NVT → NPT → production,
 each phase optional), with checkpoint resume, cloud preemption recovery, and
 Pushover notifications. Trajectory analysis is **opt-in** (a post-process hook,
-or a bundled `pmhc` preset).
+or a bundled `pmhc` preset). GROMACS in the image is **2024.2 (CUDA)**, installed
+from conda-forge — matching the Vast nodes, so `extend` can read existing 2024.2
+`.tpr` files.
 
 ## Architecture — no docker-in-docker
 
@@ -28,12 +30,11 @@ your workstation                          Vast.ai
 
 ## Build
 
-Base image = NGC GROMACS 2024.2, so log in to NGC first (username `$oauthtoken`,
-password = your NGC API key):
+No registry login needed — GROMACS 2024.2 (CUDA) is installed from conda-forge on
+a public CUDA base:
 
 ```bash
 cd ~/repos/gmx-md-agent
-make login        # docker login nvcr.io
 make build        # docker build -t gmx-md-agent .
 make help         # all targets
 ```

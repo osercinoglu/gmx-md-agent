@@ -1,20 +1,31 @@
 # gmx-md-agent — containerized GROMACS MD runner (local + Vast.ai/SkyPilot).
 #
-# Base: NVIDIA NGC GROMACS 2024.2 (tuned GPU build). Pulling it requires an NGC
-# login at build time:   docker login nvcr.io   (username '$oauthtoken', NGC API key)
+# GROMACS 2024.2 (CUDA) is installed from conda-forge — NO registry login is
+# required to build (the CUDA base is public on Docker Hub). This matches the
+# version the Vast nodes install and your on-prem standard, so `extend` can read
+# existing 2024.2 .tpr files.
 #
-# Build:  docker build -t gmx-md-agent .
-# Run:    see README.md  (bind-mount the replica folder at /work)
-FROM nvcr.io/hpc/gromacs:2024.2
+# Build:  make build   (docker build -t gmx-md-agent .)
+# Run:    see README.md  (bind-mount the run folder at /work; ./mda wrapper)
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Python (CLI) + SkyPilot/Vast/rsync/ssh (cloud orchestration). The NGC image is
-# Ubuntu-based; gmx is provided by the base image and put on PATH by entrypoint.sh.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip python3-venv rsync openssh-client ca-certificates curl git \
-    && rm -rf /var/lib/apt/lists/* \
-    && python3 -m pip install --no-cache-dir --upgrade pip \
-    && python3 -m pip install --no-cache-dir "skypilot[vast]" vastai
+        ca-certificates curl bzip2 git rsync openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# micromamba -> GROMACS 2024.2 (CUDA) + python + pip in /opt/gmx; then the
+# cloud-orchestration python deps into that same env.
+ENV MAMBA_ROOT_PREFIX=/opt/micromamba GMXENV=/opt/gmx
+RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
+      | tar -xj -C /usr/local/bin --strip-components=1 bin/micromamba
+RUN micromamba create -y -p "$GMXENV" -c conda-forge \
+        "gromacs=2024.2=nompi_cuda_*" python=3.11 pip \
+    || micromamba create -y -p "$GMXENV" -c conda-forge \
+        "gromacs=2024.2" python=3.11 pip
+RUN "$GMXENV/bin/pip" install --no-cache-dir --upgrade pip \
+    && "$GMXENV/bin/pip" install --no-cache-dir "skypilot[vast]" vastai
+ENV PATH=/opt/gmx/bin:$PATH
 
 WORKDIR /opt/gmx-md-agent
 COPY mdagent/    ./mdagent/
@@ -27,7 +38,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh \
 ENV PYTHONPATH=/opt/gmx-md-agent \
     PYTHONUNBUFFERED=1
 
-# The replica folder is bind-mounted here at runtime.
+# The run folder is bind-mounted here at runtime.
 WORKDIR /work
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["--help"]

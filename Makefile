@@ -1,13 +1,12 @@
 # gmx-md-agent — build + convenience targets.
-# The image base is NGC GROMACS, so `docker login nvcr.io` once before `build`.
+# GROMACS 2024.2 (CUDA) is installed from conda-forge; no registry login needed.
 IMAGE ?= gmx-md-agent
 
-.PHONY: help build login poc dryrun poc-full local-help shell clean
+.PHONY: help build poc dryrun poc-full shell clean
 
 help:
 	@echo "gmx-md-agent targets:"
-	@echo "  make build      build the Docker image ($(IMAGE))  [needs: make login]"
-	@echo "  make login      docker login nvcr.io (NGC; user \$$oauthtoken / NGC API key)"
+	@echo "  make build      build the Docker image ($(IMAGE)) — no login required"
 	@echo "  make dryrun     \$$0 cloud-path proof (sky check + render + --dryrun)"
 	@echo "  make poc        same as dryrun (cheap, safe)"
 	@echo "  make poc-full   ~\$$1-3 end-to-end proof on a real GPU (happy+resume+extend)"
@@ -21,9 +20,6 @@ help:
 
 build:
 	docker build -t $(IMAGE) .
-
-login:
-	docker login nvcr.io
 
 # Cheap, safe proof of the cloud path (no GPU rented). Needs a Vast key.
 dryrun poc:
