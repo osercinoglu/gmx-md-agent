@@ -55,6 +55,7 @@ START_STRUCT="${START_STRUCT:-}"              # starting structure (auto-detecte
 TOP="${TOP:-topol.top}"; INDEX="${INDEX:-index.ndx}"; MAXWARN="${MAXWARN:-1}"
 ANALYSIS="${ANALYSIS:-none}"                  # none | pmhc | <hook path>  (local post-process)
 DRY_GROUP="${DRY_GROUP:-Protein}"             # solvent/ions-stripping selection for analysis
+DISK_FACTOR="${DISK_FACTOR:-2}"               # abort analysis if free disk < N x est. dry traj
 LOCAL_GMX="${LOCAL_GMX:-}"
 PUSHOVER_DEVICE="${PUSHOVER_DEVICE:-}"
 PUSHOVER_CONFIG="${PUSHOVER_CONFIG:-$HOME/.pushover/pushover-config}"
@@ -392,7 +393,7 @@ run_local_analysis() {
   [ -n "$A_BASE" ] && cp -pf "$REPLICA_DIR/${A_BASE}.xtc" "$STORE/" 2>/dev/null || true
   # analyze.sh runs ANALYSIS (none -> nothing; pmhc/hook -> dry-only post-process).
   # No solvated trajectory is ever built; raw chunks stay in $STORE (.cloud_state).
-  ANALYSIS="$ANALYSIS" DRY_GROUP="$DRY_GROUP" GMX="$LOCAL_GMX" bash "$ANALYZE_SH" "$STORE" ${A_BASE:+"$A_BASE"} || return 1
+  ANALYSIS="$ANALYSIS" DRY_GROUP="$DRY_GROUP" DISK_FACTOR="$DISK_FACTOR" GMX="$LOCAL_GMX" bash "$ANALYZE_SH" "$STORE" ${A_BASE:+"$A_BASE"} || return 1
   local f
   for f in prod_dry.xtc prod_ref.pdb prod_last.pdb prod_dry.tpr; do
     cp -pf "$STORE/$f" "$REPLICA_DIR/" 2>/dev/null || true

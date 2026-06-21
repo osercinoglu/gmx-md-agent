@@ -19,6 +19,7 @@ set -euo pipefail
 export LC_ALL=C LANG=C
 GMX="${GMX:-gmx}"
 DRY_GROUP="${DRY_GROUP:-Protein}"
+DISK_FACTOR="${DISK_FACTOR:-2}"
 ANALYSIS="${ANALYSIS:-none}"
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 FOLDER="${1:?usage: analyze.sh <folder> [extend_base]}"
@@ -44,11 +45,11 @@ fi
 case "$ANALYSIS" in
   pmhc)
     echo ">> analysis=pmhc preset (dry-only)"
-    GMX="$GMX" DRY_GROUP="$DRY_GROUP" bash "$HERE/presets/analyze_pmhc.sh" "$FOLDER" "$LAST_TPR" "$EXT_BASE" ;;
+    GMX="$GMX" DRY_GROUP="$DRY_GROUP" DISK_FACTOR="$DISK_FACTOR" bash "$HERE/presets/analyze_pmhc.sh" "$FOLDER" "$LAST_TPR" "$EXT_BASE" ;;
   *)
     if [ -f "$ANALYSIS" ]; then
       echo ">> analysis hook: $ANALYSIS"
-      GMX="$GMX" DRY_GROUP="$DRY_GROUP" bash "$ANALYSIS" "$FOLDER" "$LAST_TPR" "$EXT_BASE"
+      GMX="$GMX" DRY_GROUP="$DRY_GROUP" DISK_FACTOR="$DISK_FACTOR" bash "$ANALYSIS" "$FOLDER" "$LAST_TPR" "$EXT_BASE"
     else
       echo ">> WARNING: ANALYSIS='$ANALYSIS' is neither none/pmhc nor an existing hook — skipping"
     fi ;;
