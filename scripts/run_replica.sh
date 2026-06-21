@@ -39,9 +39,27 @@ PUSHOVER_USER="${PUSHOVER_USER:-}"
 PUSHOVER_DEVICE="${PUSHOVER_DEVICE:-}"
 # =============================================================================
 
-HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# Operate on the REPLICA directory (1st arg, else the current dir) — NOT where
+# this script file happens to live. This lets you run a central copy against a
+# folder (bash /path/run_replica.sh <replica_dir>) or from inside it (cd dir;
+# bash .../run_replica.sh). Helper files (mdp/, pushover.sh, add_chain_ids.py)
+# are taken from the replica dir, falling back to the script's own dir.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+HERE="$(cd "${1:-$PWD}" 2>/dev/null && pwd)" || { echo "ERROR: replica dir '${1:-$PWD}' not found"; exit 1; }
 cd "$HERE"
 REPLICA_TAG="$(basename "$HERE")"
+
+# Guard: refuse to run (and silently "start over") in a non-replica dir.
+if [ ! -f topol.top ] || ! ls solvated_ions.pdb ./*.gro ./*.pdb >/dev/null 2>&1; then
+  echo "ERROR: '$HERE' is not a replica dir (need topol.top + a structure .pdb/.gro)."
+  echo "  Run from INSIDE a replica dir, or: bash <path>/run_replica.sh <replica_dir>"
+  exit 1
+fi
+# Helpers: prefer the replica dir, else copy from the script's dir.
+[ -d mdp ]              || cp -r "$SCRIPT_DIR/mdp" ./mdp        2>/dev/null || true
+[ -f add_chain_ids.py ] || cp    "$SCRIPT_DIR/add_chain_ids.py" .  2>/dev/null || true
+[ -f pushover.sh ]      || cp    "$SCRIPT_DIR/pushover.sh"      .  2>/dev/null || true
+
 RUN_LOG="$HERE/run_replica.log"
 exec > >(tee -a "$RUN_LOG") 2>&1
 
@@ -224,70 +242,85 @@ for i in $(seq 1 "$N_STAGES"); do
   advance "$(awk "BEGIN{printf \"%.4f\", $W_PROD_TOTAL / $N_STAGES}")"
 done
 
-# ---------- 5. Analysis prep ----------
-stage_banner "Analysis: trjcat → whole → nojump → center → fit → dry → PDB"
-
+# ---------- 5. Analysis prep (DRY-ONLY: solvent+ions stripped FIRST) ----------
+# Disk-safety + correctness: the solvated trajectory must exist ONLY as the raw
+# md_part*.xtc chunks. We NEVER write a solvated concatenated/whole/fit copy
+# (building those was ~6x the trajectory on disk and filled the drive). Instead
+# we strip to the Protein group up front, make a matching dry reference tpr with
+# convert-tpr, and run whole -> nojump -> center -> fit on DRY data only. These
+# are per-molecule/protein operations, so the protein coordinates are identical
+# to the old pipeline. Also fixes the old prod_nojump self-referential -f bug.
+stage_banner "Analysis (dry-only): per-chunk dry+whole → trjcat → nojump → center → fit → PDB"
+DRY_GROUP="${DRY_GROUP:-Protein}"
 LAST_TPR="$(printf "md_part%02d.tpr" "$N_STAGES")"
+[ -f "$LAST_TPR" ] || LAST_TPR="$(ls -v md_part*.tpr 2>/dev/null | tail -1)"
 PROD_XTCS=$(ls md_part??.xtc 2>/dev/null | sort -V)
-if [ -z "$PROD_XTCS" ]; then
-  echo "no md_part*.xtc files found — production stage outputs missing"
-  exit 1
+[ -n "$PROD_XTCS" ] || { echo "no md_part*.xtc files found — production outputs missing"; exit 1; }
+if ls md_part*.part*.xtc >/dev/null 2>&1; then
+  PROD_XTCS=$(ls md_part??.xtc md_part*.part*.xtc 2>/dev/null | sort -uV); TRJCAT_FLAGS=""
+else
+  TRJCAT_FLAGS="-cat"
 fi
 
-# Concatenate parts (raw)
-if [ ! -f prod.xtc ]; then
-  "$GMX" trjcat -f $PROD_XTCS -o prod.xtc -cat
+# Dry reference topology (atoms = DRY_GROUP) so downstream -s matches the dry xtc.
+[ -f prod_dry.tpr ] || echo "$DRY_GROUP" | "$GMX" convert-tpr -s "$LAST_TPR" -n index.ndx -o prod_dry.tpr
+
+# Pre-flight disk guard: abort early if free disk < DISK_FACTOR x estimated dry
+# trajectory (default 2x). Estimate dry bytes ~= raw_bytes * dry_atoms/full_atoms.
+DISK_FACTOR="${DISK_FACTOR:-2}"
+_natoms() { "$GMX" dump -s "$1" 2>/dev/null | awk '/^[[:space:]]*natoms/{print $NF; exit}'; }
+_human()  { awk -v b="$1" 'BEGIN{printf "%.1f GiB", b/1073741824}'; }
+FA=$(_natoms "$LAST_TPR") || true
+DA=$(_natoms prod_dry.tpr) || true
+RAW_BYTES=$(du -cb -- $PROD_XTCS 2>/dev/null | tail -1 | awk '{print $1}')
+if [ -n "${FA:-}" ] && [ -n "${DA:-}" ] && [ "${FA:-0}" -gt 0 ] 2>/dev/null && [ -n "${RAW_BYTES:-}" ]; then
+  DRYEST=$(awk -v r="$RAW_BYTES" -v d="$DA" -v f="$FA" 'BEGIN{printf "%.0f", r*d/f}')
+  NEED=$(awk -v t="$DRYEST" -v k="$DISK_FACTOR" 'BEGIN{printf "%.0f", t*k}')
+  AVAIL=$(df -PB1 . | awk 'NR==2{print $4}')
+  if awk -v a="$AVAIL" -v n="$NEED" 'BEGIN{exit !(a < n)}'; then
+    echo "ERROR: not enough free disk for analysis on $(df -P . | awk 'NR==2{print $6}')."
+    echo "  estimated dry trajectory ~$(_human "$DRYEST"); need ~$(_human "$NEED") (${DISK_FACTOR}x); free $(_human "$AVAIL")."
+    echo "  Free up space (e.g. delete old solvated prod_*.xtc) and re-run, or lower DISK_FACTOR."
+    exit 1
+  fi
+  echo "[disk_guard] ok: dry est ~$(_human "$DRYEST"), free $(_human "$AVAIL") (need ${DISK_FACTOR}x ~$(_human "$NEED"))"
+else
+  echo "[disk_guard] could not estimate sizes — skipping disk check"
 fi
 
-# PBC: whole  (input group: 0 = System)
-if [ ! -f prod_whole.xtc ]; then
-  echo 0 | "$GMX" trjconv -s "$LAST_TPR" -f prod.xtc -o prod_whole.xtc -pbc whole
-fi
+# Strip solvent+ions and make whole PER CHUNK into a temp dir (small files).
+rm -rf .dryan; mkdir -p .dryan
+di=0; DRYLIST=""
+for c in $PROD_XTCS; do
+  o=$(printf ".dryan/d%04d.xtc" "$di"); di=$((di+1))
+  echo "$DRY_GROUP" | "$GMX" trjconv -s "$LAST_TPR" -f "$c" -n index.ndx -pbc whole -o "$o"
+  DRYLIST="$DRYLIST $o"
+done
 
-# PBC: nojump
-if [ ! -f prod_nojump.xtc ]; then
-  echo 0 | "$GMX" trjconv -s "$LAST_TPR" -f prod_nojump.xtc -o prod_nojump.xtc -pbc nojump 2>/dev/null \
-    || echo 0 | "$GMX" trjconv -s "$LAST_TPR" -f prod_whole.xtc -o prod_nojump.xtc -pbc nojump
-fi
+# Concatenate the dry chunks, then nojump/center/fit on the DRY reference,
+# deleting each intermediate as soon as the next exists (peak ~2x dry traj).
+# Default groups of a protein-only tpr: 0=System, 1=Protein, 4=Backbone.
+"$GMX" trjcat -f $DRYLIST -o .dryan/whole.xtc $TRJCAT_FLAGS && rm -f .dryan/d*.xtc
+echo 0          | "$GMX" trjconv -s prod_dry.tpr -f .dryan/whole.xtc  -o .dryan/nojump.xtc -pbc nojump && rm -f .dryan/whole.xtc
+printf "1\n0\n" | "$GMX" trjconv -s prod_dry.tpr -f .dryan/nojump.xtc -o .dryan/center.xtc -center -pbc mol -ur compact && rm -f .dryan/nojump.xtc
+printf "4\n0\n" | "$GMX" trjconv -s prod_dry.tpr -f .dryan/center.xtc -o prod_dry.xtc      -fit rot+trans && rm -f .dryan/center.xtc
 
-# Center on Protein (center group 1=Protein, output 0=System)
-if [ ! -f prod_center.xtc ]; then
-  printf "1\n0\n" | "$GMX" trjconv -s "$LAST_TPR" -f prod_nojump.xtc -o prod_center.xtc \
-                                   -center -pbc mol -ur compact -n index.ndx
-fi
-
-# Fit rot+trans on Backbone (group 4), write System (0)
-if [ ! -f prod_fit.xtc ]; then
-  printf "4\n0\n" | "$GMX" trjconv -s "$LAST_TPR" -f prod_center.xtc -o prod_fit.xtc \
-                                   -fit rot+trans -n index.ndx
-fi
-
-# Dry: keep only Protein (group 1) -> water/ions stripped
-if [ ! -f prod_dry.xtc ]; then
-  echo 1 | "$GMX" trjconv -s "$LAST_TPR" -f prod_fit.xtc -o prod_dry.xtc -n index.ndx
-fi
-
-# Reference (frame 0) + final (frame -1) PDB, Protein only, then stamp chain IDs
-if [ ! -f prod_ref.pdb ]; then
-  echo 1 | "$GMX" trjconv -s "$LAST_TPR" -f prod_fit.xtc -o prod_ref.pdb \
-                          -dump 0 -conect -n index.ndx
-fi
-if [ ! -f prod_last.pdb ]; then
-  echo 1 | "$GMX" trjconv -s "$LAST_TPR" -f prod_fit.xtc -o prod_last.pdb \
-                          -dump 999999999 -conect -n index.ndx
-fi
-
+# Reference (frame 0) + final-frame PDB from the dry trajectory, stamp chain IDs.
+echo 0 | "$GMX" trjconv -s prod_dry.tpr -f prod_dry.xtc -o prod_ref.pdb  -dump 0          -conect
+echo 0 | "$GMX" trjconv -s prod_dry.tpr -f prod_dry.xtc -o prod_last.pdb -dump 999999999  -conect
 python3 add_chain_ids.py prod_ref.pdb  topol_Protein_chain_A.itp topol_Protein_chain_B.itp topol_Protein_chain_C.itp
 python3 add_chain_ids.py prod_last.pdb topol_Protein_chain_A.itp topol_Protein_chain_B.itp topol_Protein_chain_C.itp
 
+# Drop all intermediates; keep only the dry deliverables. Raw chunks untouched.
+rm -rf .dryan
 advance $W_ANALYSIS
 
 echo
 echo "============================================================================"
 echo "[$(date '+%F %T')] REPLICA COMPLETE: $REPLICA_TAG"
-echo "  Concatenated trajectory : prod.xtc"
-echo "  Analysis-ready (dry/fit): prod_dry.xtc  (water/ions removed)"
-echo "  Reference PDB           : prod_ref.pdb  (chain IDs A/B/C)"
-echo "  Final-frame PDB         : prod_last.pdb (chain IDs A/B/C)"
+echo "  Analysis-ready (dry/fit): prod_dry.xtc   (water+ions removed)"
+echo "  Reference / final PDB   : prod_ref.pdb / prod_last.pdb (chain IDs A/B/C)"
+echo "  Dry reference topology  : prod_dry.tpr"
+echo "  Solvated data remains ONLY in the raw md_part*.xtc chunks (no prod.xtc)."
 echo "============================================================================"
-notify "DONE — 750 ns + analysis ready" "$REPLICA_TAG ✅" 0
+notify "DONE — production + dry analysis ready (no solvated prod.xtc)" "$REPLICA_TAG ✅" 0
