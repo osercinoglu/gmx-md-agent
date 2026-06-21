@@ -96,7 +96,7 @@ destroy_all_vast() {
 
 verify_results() {
   say "Verifying results in $POC_DIR"
-  [ -s "$POC_DIR/prod.xtc" ]     && ok "prod.xtc present"     || bad "prod.xtc missing"
+  [ -s "$POC_DIR/prod_dry.xtc" ]     && ok "prod_dry.xtc present"     || bad "prod_dry.xtc missing"
   [ -s "$POC_DIR/prod_ref.pdb" ] && ok "prod_ref.pdb present" || bad "prod_ref.pdb missing"
   if [ -s "$POC_DIR/prod_ref.pdb" ]; then
     if awk 'substr($0,1,4)=="ATOM"{print substr($0,22,1)}' "$POC_DIR/prod_ref.pdb" | sort -u | tr -d '\n' | grep -q 'ABC'; then
@@ -136,8 +136,8 @@ poc_happy() {
   pick_offer
   say "Launching POC (auto-supervised): provision + run + pull + local analysis + teardown"
   poc_env bash "$RUNNER" launch "$POC_DIR"
-  say "Waiting (≤${POC_TIMEOUT}s) for the supervisor to finish (prod.xtc in $POC_DIR)…"
-  if wait_for "$POC_DIR" "prod.xtc" "$POC_TIMEOUT"; then echo; ok "supervisor produced prod.xtc"; else echo; bad "no prod.xtc within timeout — see $(basename "$POC_DIR")/.cloud_supervise.log"; fi
+  say "Waiting (≤${POC_TIMEOUT}s) for the supervisor to finish (prod_dry.xtc in $POC_DIR)…"
+  if wait_for "$POC_DIR" "prod_dry.xtc" "$POC_TIMEOUT"; then echo; ok "supervisor produced prod_dry.xtc"; else echo; bad "no prod_dry.xtc within timeout — see $(basename "$POC_DIR")/.cloud_supervise.log"; fi
   verify_results
   teardown
 }
@@ -165,8 +165,8 @@ poc_resume() {
   [ "$resumed" = 1 ] && ok "GROMACS resumed from checkpoint after preemption (continuation produced)" \
                       || bad "could not confirm checkpoint resume — inspect $(basename "$POC_DIR")/.cloud_supervise.log + $STORE/run_pipeline.log"
 
-  say "Waiting for the recovered run to finish + analyze (prod.xtc)…"
-  if wait_for "$POC_DIR" "prod.xtc" "$POC_TIMEOUT"; then echo; ok "recovered run completed + analyzed"; else echo; bad "recovered run did not complete in time"; fi
+  say "Waiting for the recovered run to finish + analyze (prod_dry.xtc)…"
+  if wait_for "$POC_DIR" "prod_dry.xtc" "$POC_TIMEOUT"; then echo; ok "recovered run completed + analyzed"; else echo; bad "recovered run did not complete in time"; fi
   verify_results
   teardown
 }
@@ -182,10 +182,10 @@ poc_extend() {
     || { bad "no $base.{tpr,cpt,xtc} in $STORE to extend"; return; }
   say "Seeding extend base ($base) into $POC_DIR; extending by +0.2 ns on a cloud GPU"
   cp -pf "$STORE/${base}.tpr" "$STORE/${base}.cpt" "$STORE/${base}.xtc" "$POC_DIR/"
-  rm -f "$POC_DIR/prod.xtc"        # so the wait below detects the NEW (extended) analysis
+  rm -f "$POC_DIR/prod_dry.xtc"        # so the wait below detects the NEW (extended) analysis
   EXTEND_FROM="$base" EXTEND_BY_NS=0.2 poc_env bash "$RUNNER" extend "$POC_DIR"
-  say "Waiting (≤${POC_TIMEOUT}s) for the extension to finish (prod.xtc) …"
-  if wait_for "$POC_DIR" "prod.xtc" "$POC_TIMEOUT"; then echo; ok "extension produced prod.xtc"; else echo; bad "extension did not finish in time"; fi
+  say "Waiting (≤${POC_TIMEOUT}s) for the extension to finish (prod_dry.xtc) …"
+  if wait_for "$POC_DIR" "prod_dry.xtc" "$POC_TIMEOUT"; then echo; ok "extension produced prod_dry.xtc"; else echo; bad "extension did not finish in time"; fi
   ls "$STORE"/md_ext*.xtc >/dev/null 2>&1 \
     && ok "md_ext* continuation produced (convert-tpr -extend + mdrun -cpi worked)" \
     || bad "no md_ext* chunk produced — inspect $(basename "$POC_DIR")/.cloud_supervise.log"

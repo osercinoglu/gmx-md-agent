@@ -108,12 +108,21 @@ finish.
 
 ## Analysis (`--analysis`)
 
-- `none` (default) — just the concatenated `prod.xtc`; post-process it yourself.
-- `pmhc` — the bundled preset: `trjconv` whole → nojump → center(grp 1) →
-  fit(grp 4) → dry → ref/last PDB → chain-ID stamping (chains A/B/C). Expects the
-  default `make_ndx` groups and `topol_Protein_chain_{A,B,C}.itp`.
+**Disk-safety rule:** the *solvated* trajectory exists ONLY as the raw
+`md_part*` / `md_ext*` / `<base>.xtc` chunks. No analysis step ever writes a
+solvated concatenated/whole/fit copy (building those was ~6× the trajectory on
+disk and would fill the drive). Solvent+ions are stripped **first** (the
+`--dry-group`, default `Protein`).
+
+- `none` (default) — do nothing; leave the raw chunks. No concatenation.
+- `pmhc` — **dry-only** preset: `convert-tpr` builds a dry reference, each chunk
+  is stripped+made-whole, then nojump → center(grp 1) → fit(grp 4) on the dry
+  data, producing `prod_dry.xtc`, `prod_ref.pdb`, `prod_last.pdb`, `prod_dry.tpr`
+  (+ chain-ID stamping A/B/C if the chain itps are present). Protein coordinates
+  are identical to the old full-system-then-strip pipeline.
 - a path to your own **hook script** — run after production as
-  `bash <hook> <folder> prod.xtc <last.tpr>`.
+  `bash <hook> <folder> <last.tpr> [extend_base]` (it gets the raw chunks; it
+  decides what to write).
 
 ## Layout
 
@@ -122,7 +131,7 @@ mdagent/cli.py            argparse front-end (flags -> env -> bash)
 scripts/cloud/            run_cloud_replica.sh (+supervisor/recovery/extend),
                           node/run_pipeline.sh (mdp-driven phases, GPU/CPU auto),
                           list_offers.sh, poc.sh, SkyPilot template
-scripts/analyze.sh        concat chunks -> prod.xtc, then ANALYSIS dispatch
+scripts/analyze.sh        ANALYSIS dispatch (none = raw chunks only; no solvated concat)
 scripts/presets/analyze_pmhc.sh   the opt-in pMHC trjconv + chain-ID preset
 scripts/mdp/              example mdp files (the bundled pMHC test system)
 Dockerfile, entrypoint.sh

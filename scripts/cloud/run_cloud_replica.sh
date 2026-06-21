@@ -54,6 +54,7 @@ EM_MDP="${EM_MDP:-}"; NVT_MDP="${NVT_MDP:-}"; NPT_MDP="${NPT_MDP:-}"   # optiona
 START_STRUCT="${START_STRUCT:-}"              # starting structure (auto-detected on node if unset)
 TOP="${TOP:-topol.top}"; INDEX="${INDEX:-index.ndx}"; MAXWARN="${MAXWARN:-1}"
 ANALYSIS="${ANALYSIS:-none}"                  # none | pmhc | <hook path>  (local post-process)
+DRY_GROUP="${DRY_GROUP:-Protein}"             # solvent/ions-stripping selection for analysis
 LOCAL_GMX="${LOCAL_GMX:-}"
 PUSHOVER_DEVICE="${PUSHOVER_DEVICE:-}"
 PUSHOVER_CONFIG="${PUSHOVER_CONFIG:-$HOME/.pushover/pushover-config}"
@@ -389,10 +390,11 @@ run_local_analysis() {
   ( shopt -s nullglob; for f in "$REPLICA_DIR"/*.itp; do cp -pf "$f" "$STORE/"; done )
   cp -pf "$PREP/add_chain_ids.py" "$STORE/" 2>/dev/null || true
   [ -n "$A_BASE" ] && cp -pf "$REPLICA_DIR/${A_BASE}.xtc" "$STORE/" 2>/dev/null || true
-  # analyze.sh concatenates chunks -> prod.xtc, then runs ANALYSIS (none|pmhc|hook).
-  ANALYSIS="$ANALYSIS" GMX="$LOCAL_GMX" bash "$ANALYZE_SH" "$STORE" ${A_BASE:+"$A_BASE"} || return 1
+  # analyze.sh runs ANALYSIS (none -> nothing; pmhc/hook -> dry-only post-process).
+  # No solvated trajectory is ever built; raw chunks stay in $STORE (.cloud_state).
+  ANALYSIS="$ANALYSIS" DRY_GROUP="$DRY_GROUP" GMX="$LOCAL_GMX" bash "$ANALYZE_SH" "$STORE" ${A_BASE:+"$A_BASE"} || return 1
   local f
-  for f in prod.xtc prod_dry.xtc prod_ref.pdb prod_last.pdb; do
+  for f in prod_dry.xtc prod_ref.pdb prod_last.pdb prod_dry.tpr; do
     cp -pf "$STORE/$f" "$REPLICA_DIR/" 2>/dev/null || true
   done
   return 0
@@ -686,7 +688,7 @@ cmd_status() {
   echo "=== supervisor ==="
   if [ -f "$SUPPID" ] && kill -0 "$(cat "$SUPPID")" 2>/dev/null; then echo "  running (PID $(cat "$SUPPID"))"; else echo "  not running"; fi
   echo "=== progress ==="
-  local adone=0; [ -f "$REPLICA_DIR/prod.xtc" ] && adone=1
+  local adone=0; { [ -f "$REPLICA_DIR/prod_dry.xtc" ] || [ -f "$STORE/status/ALL_DONE" ]; } && adone=1
   echo "  overall: $(progress_str "$STORE" "$N_STAGES" "$adone")"
   local sstr; sstr="$(stage_step_str "$STORE")"; [ -n "$sstr" ] && echo "  current: $sstr"
   echo "  markers: $(ls -1 "$STORE/status" 2>/dev/null | tr '\n' ' ' | sed 's/ $//' || echo '(none yet)')"

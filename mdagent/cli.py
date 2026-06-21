@@ -106,6 +106,7 @@ def cloud_env(a):
         "NVT_MDP": abspath_or_none(getattr(a, "nvt_mdp", None)),
         "NPT_MDP": abspath_or_none(getattr(a, "npt_mdp", None)),
         "ANALYSIS": getattr(a, "analysis", None) or "none",
+        "DRY_GROUP": getattr(a, "dry_group", None) or "Protein",
         "GPU_NAMES": getattr(a, "gpu_names", None), "TYPE": getattr(a, "type", None),
         "PICK": getattr(a, "pick", None), "PUSHOVER_DEVICE": getattr(a, "pushover_device", None),
         "VAST_API_KEY": os.environ.get("VAST_API_KEY"),
@@ -136,7 +137,8 @@ def cmd_local(a):
     stage_local_pipeline(folder, a)
     sh(["bash", folder / "run_pipeline.sh"], env=local_run_env(a), cwd=folder)
     if not a.skip_analysis:
-        sh(["bash", ANALYZE, folder], env={"GMX": "gmx", "ANALYSIS": a.analysis or "none"})
+        sh(["bash", ANALYZE, folder],
+           env={"GMX": "gmx", "ANALYSIS": a.analysis or "none", "DRY_GROUP": a.dry_group})
     print(f">> LOCAL run complete in {folder}")
 
 
@@ -179,7 +181,8 @@ def cmd_extend(a):
         }
         sh(["bash", folder / "run_pipeline.sh"], env=env, cwd=folder)
         if not a.skip_analysis:
-            sh(["bash", ANALYZE, folder, base], env={"GMX": "gmx", "ANALYSIS": a.analysis or "none"})
+            sh(["bash", ANALYZE, folder, base],
+               env={"GMX": "gmx", "ANALYSIS": a.analysis or "none", "DRY_GROUP": a.dry_group})
         print(f">> LOCAL extend complete in {folder}")
     else:  # cloud
         e = cloud_env(a)
@@ -215,6 +218,7 @@ def add_inputs(sp):
     sp.add_argument("--nvt-mdp", default=None, help="NVT mdp (optional phase)")
     sp.add_argument("--npt-mdp", default=None, help="NPT mdp (optional phase)")
     sp.add_argument("--analysis", default="none", help="none (default) | pmhc | <hook script path>")
+    sp.add_argument("--dry-group", default="Protein", help="solvent/ions-stripping selection (default Protein)")
 
 
 def add_cloud_flags(sp):
@@ -260,6 +264,7 @@ def build_parser():
     sp.add_argument("--nt", type=int, default=None)
     sp.add_argument("--gpu-id", type=int, default=0)
     sp.add_argument("--analysis", default="none", help="none | pmhc | <hook>")
+    sp.add_argument("--dry-group", default="Protein", help="solvent/ions-stripping selection (default Protein)")
     sp.add_argument("--skip-analysis", action="store_true")
     add_cloud_flags(sp)
     sp.set_defaults(func=cmd_extend)
