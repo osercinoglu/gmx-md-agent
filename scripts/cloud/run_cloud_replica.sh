@@ -866,7 +866,7 @@ cmd_supervise() {
     MODE="extend"; N_STAGES="${EXTEND_STAGES:-$N_STAGES}"; NS_BASE="${EXTEND_CURRENT_NS:-0}"; STAGE_WORD="extension"
     echo "[$(date '+%F %T')] mode=EXTEND base=${EXTEND_BASE:-?} from ${NS_BASE} ns in ${N_STAGES} x ${STAGE_NS} ns chunks"
   fi
-  local restarts=0 fails=0 last_prod=0 em_done=0 nvt_done=0 npt_done=0 first_pull=1 nprod VAST_ID="" gone_confirm=0
+  local restarts=0 fails=0 last_prod=0 em_done=0 nvt_done=0 npt_done=0 first_pull=1 nprod VAST_ID="" gone_confirm=0 relaunch_grace=0
   while true; do
     # resolve (or re-resolve after a recovery) the Vast instance id for messages
     if [ -z "$VAST_ID" ] || [ "$VAST_ID" = "vast#?" ]; then refresh_vast_id "$JOB"; fi
@@ -945,13 +945,20 @@ cmd_supervise() {
       return 1
     fi
 
-    # SkyPilot-level failure with NO node marker (e.g. on-node setup failed before
-    # run_pipeline wrote status/FAILED). ONLY act when NO job is active AND the queue
-    # shows a real FAILED/FAILED_SETUP. We anchor on whole-word states and do NOT
-    # match CANCELLED — the recovery path's own `sky down` leaves a CANCELLED row, and
-    # matching it (or grepping the whole history) would tear down a healthy relaunch.
-    local _q; _q="$("$SKY" queue "$JOB" 2>/dev/null || true)"
-    if ! printf '%s' "$_q" | grep -qwE 'RUNNING|PENDING|SETTING_UP|INIT' \
+    # SkyPilot-level failure BEFORE the pipeline ever started (on-node setup failed
+    # before run_pipeline could write status/STARTED). Strictly gated to avoid the
+    # false-positive cascade that tore down healthy/producing nodes:
+    #   - skip entirely if a STARTED marker exists — the node got PAST setup, so any
+    #     FAILED row in `sky queue` is a stale/previous attempt, not this node's setup
+    #     (a real post-start failure writes status/FAILED, handled above);
+    #   - skip during a relaunch's bring-up (relaunch_grace > 0) so the previous
+    #     attempt's lingering FAILED row + the not-yet-RUNNING new job don't re-fire;
+    #   - only then: no active job AND a real FAILED/FAILED_SETUP (never CANCELLED —
+    #     the recovery path's own `sky down` leaves that row).
+    local _q=""
+    [ ! -f "$STORE/status/STARTED" ] && [ "${relaunch_grace:-0}" -le 0 ] && _q="$("$SKY" queue "$JOB" 2>/dev/null || true)"
+    if [ -n "$_q" ] \
+       && ! printf '%s' "$_q" | grep -qwE 'RUNNING|PENDING|SETTING_UP|INIT' \
        && printf '%s' "$_q" | grep -qwE 'FAILED|FAILED_SETUP'; then
       pull_verified "$JOB" "$STORE" >/dev/null 2>&1 || true   # grab any logs first
       # Auto-blocklist the failing physical machine (broken TLS/CA, kaalia shim,
@@ -975,7 +982,7 @@ cmd_supervise() {
         "$SKY" down -y "$JOB" >/dev/null 2>&1 || true
         VAST_ID=""; restage_state "$STORE" "$STAGE"
         ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run $AUTOSTOP_ARGS ) \
-          && { echo "[$(date '+%F %T')] relaunched after setup failure"; fails=0; } \
+          && { echo "[$(date '+%F %T')] relaunched after setup failure"; fails=0; relaunch_grace=3; } \
           || echo "[$(date '+%F %T')] relaunch failed; retry next cycle"
       else
         notify "$TAG ❌ setup/job FAILED and max retries ($MAX_RESTARTS) exhausted — tearing down" "$TAG ❌" 1
@@ -1027,7 +1034,7 @@ cmd_supervise() {
             "$SKY" down -y "$JOB" >/dev/null 2>&1 || true
             VAST_ID=""; restage_state "$STORE" "$STAGE"
             if ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run $AUTOSTOP_ARGS ); then
-              echo "[$(date '+%F %T')] relaunched $JOB; resuming pulls"; fails=0
+              echo "[$(date '+%F %T')] relaunched $JOB; resuming pulls"; fails=0; relaunch_grace=3
             else
               echo "[$(date '+%F %T')] relaunch failed; will retry next cycle"
             fi
@@ -1035,6 +1042,8 @@ cmd_supervise() {
         fi
       fi
     fi
+
+    [ "${relaunch_grace:-0}" -gt 0 ] && relaunch_grace=$((relaunch_grace-1))   # bring-up grace for a fresh relaunch
 
     # Heartbeat each cycle so `docker logs`/`follow` shows liveness between the
     # (coarser) milestone/Pushover events — makes it obvious the run is alive.
