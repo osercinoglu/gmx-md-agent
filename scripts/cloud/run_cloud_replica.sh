@@ -257,6 +257,26 @@ print(out)
 }
 refresh_vast_id() { VAST_ID="$(vast_desc "$1")"; return 0; }
 
+# Echo the Vast MACHINE id backing cluster $1 (the physical host, for blocklisting),
+# or nothing. Distinct from vast_desc, which returns the per-rental INSTANCE id.
+machine_of() {
+  local raw rc
+  set +e; raw="$("$VASTAI" show instances --raw 2>/dev/null)"; rc=$?; set -e
+  [ "$rc" -ne 0 ] || [ -z "$raw" ] && return 0
+  printf '%s' "$raw" | python3 -c '
+import sys, json
+job = sys.argv[1]
+try: data = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for o in (data or []):
+    lab = str(o.get("label") or "")
+    if lab.startswith(job + "-") and lab.endswith("-head"):
+        m = o.get("machine_id")
+        if m is not None: print(m)
+        break
+' "$1" 2>/dev/null || true
+}
+
 # ------------------------- progress ------------------------------------------
 # Overall progress bar+pct from the pulled stage markers, using the on-prem
 # weights (EM 2, NVT 3, NPT 5, production 85 split across stages, analysis 5).
@@ -785,6 +805,14 @@ cmd_supervise() {
   exec > >(tee -a "$SUPLOG") 2>&1
   echo "[$(date '+%F %T')] supervising $JOB  (pull cadence ${SYNC_MIN}m, max restarts ${MAX_RESTARTS})"
 
+  # Machine blocklist = user-provided VAST_BLOCK_MACHINES + auto-discovered bad hosts
+  # (persisted across restarts). Exported so the offer-selection patch excludes them.
+  local BLOCKED_MACHINES="${VAST_BLOCK_MACHINES:-}"
+  [ -s "$STORE/blocked_machines" ] && BLOCKED_MACHINES="$(cat "$STORE/blocked_machines"),$BLOCKED_MACHINES"
+  BLOCKED_MACHINES="$(printf '%s' "$BLOCKED_MACHINES" | tr ', ' '\n\n' | grep -E '^[0-9]+$' | sort -un | paste -sd, -)"
+  export VAST_BLOCK_MACHINES="$BLOCKED_MACHINES"
+  [ -n "$BLOCKED_MACHINES" ] && echo "[$(date '+%F %T')] machine blocklist: $BLOCKED_MACHINES"
+
   local N_STAGES=$(( TOTAL_NS / STAGE_NS )) MODE="normal" NS_BASE=0 STAGE_WORD="production"
   if [ -f "$STAGE/.extend.env" ]; then
     # shellcheck disable=SC1090
@@ -879,6 +907,17 @@ cmd_supervise() {
     if ! printf '%s' "$_q" | grep -qwE 'RUNNING|PENDING|SETTING_UP|INIT' \
        && printf '%s' "$_q" | grep -qwE 'FAILED|FAILED_SETUP'; then
       pull_verified "$JOB" "$STORE" >/dev/null 2>&1 || true   # grab any logs first
+      # Auto-blocklist the failing physical machine (broken TLS/CA, kaalia shim,
+      # too-new GPU, …) so the retry below — and future runs (persisted) — never
+      # re-land it. Capture the machine id BEFORE any sky down destroys the instance.
+      local _mid; _mid="$(machine_of "$JOB")"
+      if [ -n "$_mid" ] && ! printf ',%s,' "${BLOCKED_MACHINES:-}" | grep -q ",${_mid},"; then
+        BLOCKED_MACHINES="${BLOCKED_MACHINES:+$BLOCKED_MACHINES,}$_mid"
+        printf '%s' "$BLOCKED_MACHINES" > "$STORE/blocked_machines" 2>/dev/null || true
+        export VAST_BLOCK_MACHINES="$BLOCKED_MACHINES"
+        echo "[$(date '+%F %T')] auto-blocklisted machine $_mid after setup failure; blocklist now: $BLOCKED_MACHINES"
+        notify "$TAG ⛔ auto-blocklisted bad machine $_mid (setup failed)" "$TAG ⛔" 0
+      fi
       if [ "$restarts" -lt "$MAX_RESTARTS" ]; then
         # Setup failures are often TRANSIENT (mirror/download) or node-specific (a
         # broken host / too-new GPU) — relaunch on a fresh node a bounded number of
