@@ -46,6 +46,11 @@ SEL_FILE="${SEL_FILE:-$HERE/cloud_selection.env}"
 
 # ---- build the vastai query ----
 gpu_list="[$(echo "$GPU_NAMES" | sed 's/ //g')]"
+# Require the host to COMMIT the machine for >= MIN_HOURS so a multi-day run isn't
+# reclaimed mid-run. The Vast `duration` QUERY field is unreliable (it rejects sane
+# thresholds), so we filter on the JSON `duration` (seconds) in python instead. The
+# default 48h drops the very-short hosts (e.g. the 23h ones); MIN_HOURS=0 disables.
+MIN_HOURS="${MIN_HOURS:-48}"
 query="num_gpus=1 reliability>${MIN_RELIAB} cuda_vers>=${MIN_CUDA} inet_down>=${MIN_INET} disk_space>=${DISK_GB} rentable=true rented=false verified=true gpu_name in ${gpu_list}"
 if [ -n "$COUNTRIES" ]; then
   query="$query geolocation in [$(echo "$COUNTRIES" | sed 's/ //g')]"
@@ -65,7 +70,7 @@ if ! "$VASTAI" search offers "$query" $type_flag --storage "$DISK_GB" -o 'dph_to
 fi
 
 USE_SPOT="$USE_SPOT" GPU_NAMES="$GPU_NAMES" TOTAL_NS="$TOTAL_NS" STAGE_NS="$STAGE_NS" \
-TOPN="$TOPN" PICK="$PICK" DISK_GB="$DISK_GB" TYPE="$TYPE" SEL_FILE="$SEL_FILE" \
+TOPN="$TOPN" PICK="$PICK" DISK_GB="$DISK_GB" TYPE="$TYPE" SEL_FILE="$SEL_FILE" MIN_HOURS="$MIN_HOURS" \
 python3 - "$RAW" <<'PY'
 import json, os, re, sys
 
@@ -76,6 +81,7 @@ TOTAL_NS = float(os.environ["TOTAL_NS"]); STAGE_NS = float(os.environ["STAGE_NS"
 TOPN = int(os.environ["TOPN"]); USE_SPOT = os.environ["USE_SPOT"] == "true"
 PICK = os.environ.get("PICK", "").strip()
 SEL_FILE = os.environ["SEL_FILE"]; DISK_GB = os.environ["DISK_GB"]; TYPE = os.environ["TYPE"]
+MIN_HOURS = float(os.environ.get("MIN_HOURS", "0") or 0)   # drop hosts committing < this many hours
 
 # Per-replica wall-time also includes provisioning + GROMACS install + EM/NVT/NPT;
 # add a fixed overhead so the estimate isn't biased low (R2/bandwidth excluded).
@@ -142,18 +148,28 @@ for o in raw:
         "est_total": float(dph) * wall_h_total,
         "est_days": wall_h_total / 24.0,
         "est_stage": float(dph) * wall_h_stage,
+        "dur_h": (float(g(o, "duration", default=0) or 0)) / 3600.0,   # host's committed window
     })
+
+# Drop known-short hosts (keep unknown-duration ones rather than over-filter on missing data).
+if MIN_HOURS > 0:
+    _before = len(rows)
+    rows = [r for r in rows if r["dur_h"] <= 0 or r["dur_h"] >= MIN_HOURS]
+    _dropped = _before - len(rows)
+    if _dropped:
+        print(f"  (excluded {_dropped} host(s) committing < {MIN_HOURS:g}h availability; MIN_HOURS=0 to disable)")
 
 rows.sort(key=lambda r: r["dph"])
 rows = rows[:TOPN]
 if not rows:
-    print("\nNo offers matched. Loosen filters (GPU_NAMES / MIN_RELIAB / COUNTRIES).")
+    print("\nNo offers matched. Loosen filters (GPU_NAMES / MIN_RELIAB / COUNTRIES / MIN_HOURS).")
     sys.exit(2)
 
-hdr = f'{"#":>2}  {"offer_id":>10}  {"gpu":<14}{"$/hr":>7}  {"relia":>5}  {"cuda":>5}  {"inet":>6}  {"~ns/d":>5}  {"~days":>5}  {"~$/stage":>8}  {"~$/replica":>10}  {"geo":>3}'
+hdr = f'{"#":>2}  {"offer_id":>10}  {"gpu":<14}{"$/hr":>7}  {"relia":>5}  {"cuda":>5}  {"inet":>6}  {"~ns/d":>5}  {"~days":>5}  {"~$/stage":>8}  {"~$/replica":>10}  {"avail(d)":>8}  {"geo":>3}'
 print("\n" + hdr); print("-" * len(hdr))
 for i, r in enumerate(rows, 1):
-    print(f'{i:>2}  {str(r["id"]):>10}  {r["gpu"][:14]:<14}{r["dph"]:>7.3f}  {r["reliab"]:>5.2f}  {str(r["cuda"]):>5}  {str(r["inet"]):>6}  {r["nsday"]:>5}  {r["est_days"]:>5.1f}  {r["est_stage"]:>8.2f}  {r["est_total"]:>10.2f}  {str(r["geo"]):>3}')
+    _d = f'{r["dur_h"]/24:.1f}' if r["dur_h"] > 0 else "?"
+    print(f'{i:>2}  {str(r["id"]):>10}  {r["gpu"][:14]:<14}{r["dph"]:>7.3f}  {r["reliab"]:>5.2f}  {str(r["cuda"]):>5}  {str(r["inet"]):>6}  {r["nsday"]:>5}  {r["est_days"]:>5.1f}  {r["est_stage"]:>8.2f}  {r["est_total"]:>10.2f}  {_d:>8}  {str(r["geo"]):>3}')
 print(f'\nEstimates assume ~{rows[0]["nsday"]} ns/day-class throughput on a ~90k-atom box '
       f'({"INTERRUPTIBLE/spot" if USE_SPOT else "on-demand"} pricing, {DISK_GB} GiB disk).')
 print("Cost = $/hr x wall-hours; wall-hours = ns / (ns/day) x 24. ROUGH — the POC self-benchmark refines ns/day.")
@@ -193,6 +209,10 @@ def write_selection(r):
     print(f'    GPU={accel}:1   spot={str(USE_SPOT).lower()}   max $/hr={ceiling}   region={geo or "(any)"}')
     print(f'    est ~${r["est_total"]:.0f} over ~{r["est_days"]:.1f} days for {int(TOTAL_NS)} ns')
     print(f'    (reference offer id {r["id"]})')
+    if r["dur_h"] > 0 and r["dur_h"] < r["est_days"] * 24.0:
+        print(f'    ⚠ WARNING: this host commits only ~{r["dur_h"]/24:.1f} d but the run needs ~{r["est_days"]:.1f} d —')
+        print(f'      it will likely be RECLAIMED mid-run (supervisor then migrates + resumes from the last')
+        print(f'      checkpoint). Set MIN_HOURS to require a longer-window host, or accept the migration.')
 
 choice = None
 if PICK:
