@@ -14,12 +14,19 @@ set -euo pipefail
 IMAGE="${MDAGENT_IMAGE:-gmx-md-agent}"
 WORK="${MDAGENT_WORK:-$PWD}"
 
-# GPU passthrough: explicit env wins; else auto-detect the nvidia docker runtime.
+# GPU passthrough: explicit env wins; else auto-detect. Only the `local` subcommand
+# uses THIS machine's GPU — cloud/extend(--where cloud)/status/follow/teardown just
+# orchestrate (GROMACS runs on the rented node), so requesting --gpus there is
+# pointless and can hard-fail on hosts whose Docker GPU runtime/CDI isn't set up
+# (e.g. "AMD CDI spec not found"). Force on with MDAGENT_GPUS=1, off with =0.
+subcmd="${1:-}"
 gpu_args=()
 case "${MDAGENT_GPUS:-auto}" in
   1) gpu_args=(--gpus all) ;;
   0) gpu_args=() ;;
-  *) if docker info 2>/dev/null | grep -qiE 'Runtimes:.*nvidia|nvidia'; then gpu_args=(--gpus all); fi ;;
+  *) if [ "$subcmd" = "local" ] && docker info 2>/dev/null | grep -qiE 'Runtimes:.*nvidia|nvidia'; then
+       gpu_args=(--gpus all)
+     fi ;;
 esac
 
 # Mount the working folder + any credentials/state that exist on the host.
