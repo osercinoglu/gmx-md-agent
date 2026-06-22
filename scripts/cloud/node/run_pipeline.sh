@@ -27,11 +27,33 @@ set -euo pipefail
 export LC_ALL=C LANG=C
 [ -f "$HOME/gmx_activate.sh" ] && source "$HOME/gmx_activate.sh"
 
+# Robust usable-core count: `nproc` honors cgroup quota/affinity and can return 1
+# inside a Vast container even on a 32-core host (that is the -ntomp 1 GPU-starvation
+# bug). Take the largest plausible signal, then clamp to any cgroup CPU quota.
+detect_cores() {
+  local cg=0 aff=0 cpuinfo=0 npall=0 n=0 q p
+  if [ -r /sys/fs/cgroup/cpu.max ]; then                       # cgroup v2
+    read -r q p < /sys/fs/cgroup/cpu.max || true
+    [ "${q:-max}" != "max" ] && [ "${p:-0}" -gt 0 ] 2>/dev/null && cg=$(awk -v q="$q" -v p="$p" 'BEGIN{n=int(q/p);if(n<1)n=1;print n}')
+  elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && [ -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]; then  # cgroup v1
+    q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us); p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    [ "${q:-0}" -gt 0 ] 2>/dev/null && [ "${p:-0}" -gt 0 ] 2>/dev/null && cg=$(awk -v q="$q" -v p="$p" 'BEGIN{n=int(q/p);if(n<1)n=1;print n}')
+  fi
+  command -v python3 >/dev/null 2>&1 && aff=$(python3 -c 'import os;print(len(os.sched_getaffinity(0)))' 2>/dev/null || echo 0)
+  cpuinfo=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 0)
+  npall=$(nproc --all 2>/dev/null || echo 0)
+  for v in "$cg" "$aff" "$cpuinfo" "$npall"; do [ "${v:-0}" -gt "$n" ] 2>/dev/null && n="$v"; done
+  [ "${cg:-0}" -gt 0 ] 2>/dev/null && [ "$n" -gt "$cg" ] && n="$cg"   # cgroup quota is a hard ceiling
+  [ "${n:-0}" -lt 1 ] 2>/dev/null && n=1
+  printf '%d' "$n"
+}
+
 REPLICA_TAG="${REPLICA_TAG:-$(basename "$PWD")}"
 TOTAL_NS="${TOTAL_NS:-750}"
 STAGE_NS="${STAGE_NS:-50}"
 CKPT_MIN="${CKPT_MIN:-15}"
-NT="${NT:-$(nproc)}"
+NT="${NT:-$(detect_cores)}"
+if [ "${NT:-1}" -lt 2 ] 2>/dev/null; then _re=$(detect_cores); echo "[pipeline] WARNING: NT=$NT degenerate; re-detected NT=$_re" >&2; NT="$_re"; fi
 GPU_ID="${GPU_ID:-0}"
 MAXH_PER_STAGE="${MAXH_PER_STAGE:-48}"
 GMX="${GMX:-gmx}"
@@ -120,29 +142,107 @@ else
   echo "[pipeline] no GPU detected — CPU-only run (slow; fine for tests)"
 fi
 
-mdrun_fresh() {           # $1 deffnm ; $2.. offload
+# Production threading + offload are auto-tuned per node (autotune_mdrun, below).
+# Until tuned, sane defaults: -ntomp capped to a single-GPU OpenMP sweet spot (8-16;
+# scaling flattens past ~16 on many-core/NUMA hosts) + the standard offload. EM/NVT/NPT
+# use these defaults (short, not perf-critical); production uses the tuned winner.
+default_ntomp() { local c="${NT:-1}"; [ "$c" -gt 16 ] && c=16; [ "$c" -lt 1 ] && c=1; printf '%d' "$c"; }
+TUNE_NTOMP="$(default_ntomp)"
+TUNE_EXTRA=("${MD_OFFLOAD[@]}")
+
+mdrun_fresh() {           # $1 deffnm ; $2.. offload (EM passes EM_OFFLOAD)
   local d="$1"; shift
   "$GMX" mdrun -deffnm "$d" "$@" -cpo "${d}.cpt" -cpt "$CKPT_MIN" \
-               "${GPU_ARGS[@]}" -ntmpi 1 -ntomp "$NT" -pin on -maxh "$MAXH_PER_STAGE" -v
+               "${GPU_ARGS[@]}" -ntmpi 1 -ntomp "$TUNE_NTOMP" -pin on -maxh "$MAXH_PER_STAGE" -v
 }
 mdrun_resume_append() {
   local d="$1" cpt="$2"
-  "$GMX" mdrun -s "${d}.tpr" -cpi "$cpt" -deffnm "$d" -append "${MD_OFFLOAD[@]}" \
+  "$GMX" mdrun -s "${d}.tpr" -cpi "$cpt" -deffnm "$d" -append "${TUNE_EXTRA[@]}" \
                -cpo "${d}.cpt" -cpt "$CKPT_MIN" \
-               "${GPU_ARGS[@]}" -ntmpi 1 -ntomp "$NT" -pin on -maxh "$MAXH_PER_STAGE" -v
+               "${GPU_ARGS[@]}" -ntmpi 1 -ntomp "$TUNE_NTOMP" -pin on -maxh "$MAXH_PER_STAGE" -v
 }
 mdrun_resume_noappend() {
   local d="$1" cpt="$2"
-  "$GMX" mdrun -s "${d}.tpr" -cpi "$cpt" -deffnm "$d" -noappend "${MD_OFFLOAD[@]}" \
+  "$GMX" mdrun -s "${d}.tpr" -cpi "$cpt" -deffnm "$d" -noappend "${TUNE_EXTRA[@]}" \
                -cpt "$CKPT_MIN" \
-               "${GPU_ARGS[@]}" -ntmpi 1 -ntomp "$NT" -pin on -maxh "$MAXH_PER_STAGE" -v
+               "${GPU_ARGS[@]}" -ntmpi 1 -ntomp "$TUNE_NTOMP" -pin on -maxh "$MAXH_PER_STAGE" -v
 }
 mdrun_continue() {        # extend: initial continuation from a PRIOR stage's cpt
   local d="$1" src="$2"
-  "$GMX" mdrun -s "${d}.tpr" -cpi "$src" -deffnm "$d" -noappend "${MD_OFFLOAD[@]}" \
+  "$GMX" mdrun -s "${d}.tpr" -cpi "$src" -deffnm "$d" -noappend "${TUNE_EXTRA[@]}" \
                -cpt "$CKPT_MIN" \
-               "${GPU_ARGS[@]}" -ntmpi 1 -ntomp "$NT" -pin on -maxh "$MAXH_PER_STAGE" -v
+               "${GPU_ARGS[@]}" -ntmpi 1 -ntomp "$TUNE_NTOMP" -pin on -maxh "$MAXH_PER_STAGE" -v
 }
+# ---- per-instance mdrun auto-tuner -----------------------------------------
+# Benchmark a few mdrun flag-sets on THIS node+system once (after NPT, before the
+# production loop), pick the fastest VALID one, persist it (status/TUNED) so a
+# resume/recovery never re-benchmarks. Sets TUNE_NTOMP + TUNE_EXTRA used by every
+# production chunk. Falls back to the robust-NT defaults on any failure.
+perf_nsday() { awk '/^Performance:/{v=$2} END{print (v==""?0:v)}' "$1" 2>/dev/null; }
+load_tuned() {
+  [ -f "$STATUS_DIR/TUNED" ] || return 1
+  local nt extra
+  nt=$(awk -F= '/^NTOMP=/{print $2}' "$STATUS_DIR/TUNED")
+  extra=$(awk -F= '/^EXTRA=/{sub(/^EXTRA=/,"");print}' "$STATUS_DIR/TUNED")
+  [ -n "$nt" ] && [ "$nt" -ge 1 ] 2>/dev/null || return 1
+  TUNE_NTOMP="$nt"; read -r -a TUNE_EXTRA <<< "$extra"
+  echo "[autotune] reusing persisted tune: -ntomp $TUNE_NTOMP ${TUNE_EXTRA[*]}"; return 0
+}
+autotune_mdrun() {
+  AUTOTUNE="${AUTOTUNE:-1}"; BENCH_STEPS="${BENCH_STEPS:-4000}"
+  BENCH_RESET="${BENCH_RESET:-1500}"; BENCH_BUDGET_S="${BENCH_BUDGET_S:-900}"
+  local TUNE_DIR="$HERE/bench"
+  load_tuned && return 0
+  if [ "$AUTOTUNE" != "1" ] || [ "${#MD_OFFLOAD[@]}" -eq 0 ]; then
+    echo "[autotune] disabled or CPU-only — using defaults -ntomp $TUNE_NTOMP"; return 0; fi
+  { [ -f mdp/prod.mdp ] && [ -f "$prev_gro" ]; } || { echo "[autotune] no prod.mdp/equilibrated gro — defaults"; return 0; }
+  mkdir -p "$TUNE_DIR"
+  stage_banner "Autotune mdrun (${BENCH_STEPS} steps/trial, budget ${BENCH_BUDGET_S}s)"
+  local btpr="$TUNE_DIR/bench.tpr"
+  cp -f mdp/prod.mdp "$TUNE_DIR/bench.mdp"
+  if grep -qE '^[[:space:]]*nsteps[[:space:]]*=' "$TUNE_DIR/bench.mdp"; then
+    sed -i -E "s|^([[:space:]]*nsteps[[:space:]]*=).*|\1 ${BENCH_STEPS}|" "$TUNE_DIR/bench.mdp"
+  else printf 'nsteps = %s\n' "$BENCH_STEPS" >> "$TUNE_DIR/bench.mdp"; fi
+  set +e
+  "$GMX" grompp -f "$TUNE_DIR/bench.mdp" -c "$prev_gro" -r "$prev_gro" -p "$TOP" \
+         ${INDEX:+-n "$INDEX"} ${prev_cpt:+-t "$prev_cpt"} -o "$btpr" -maxwarn "$MAXWARN" >"$TUNE_DIR/grompp.out" 2>&1
+  local grc=$?; set -e
+  { [ $grc -eq 0 ] && [ -f "$btpr" ]; } || { echo "[autotune] bench grompp failed — defaults"; rm -rf "$TUNE_DIR"; return 0; }
+  local ncap="$NT"; [ "$ncap" -gt 16 ] && ncap=16
+  local -a CANDS=("$ncap|-nb gpu -pme gpu -bonded gpu")
+  [ "$NT" -ge 8 ]  && CANDS+=("8|-nb gpu -pme gpu -bonded gpu")
+  [ "$NT" -ge 16 ] && CANDS+=("16|-nb gpu -pme gpu -bonded gpu")
+  CANDS+=("$ncap|-nb gpu -pme gpu -bonded cpu")
+  CANDS+=("$ncap|-nb gpu -pme gpu -bonded gpu -update gpu")   # may be rejected -> auto-skipped
+  # NB: a separate PME rank (-npme) is NOT a single-GPU lever — omitted on purpose.
+  local start_ts best_ns="0" best_spec="" spec ntomp offload rc nsday i=0 elapsed d
+  start_ts=$(date +%s)
+  for spec in "${CANDS[@]}"; do
+    i=$((i+1)); elapsed=$(( $(date +%s) - start_ts ))
+    [ "$elapsed" -ge "$BENCH_BUDGET_S" ] && { echo "[autotune] budget hit — stopping sweep"; break; }
+    ntomp="${spec%%|*}"; offload="${spec#*|}"; d="$TUNE_DIR/t$i"
+    echo "[autotune] trial $i: -ntomp $ntomp $offload"
+    set +e
+    timeout "$BENCH_BUDGET_S" "$GMX" mdrun -s "$btpr" -deffnm "$d" -ntmpi 1 -ntomp "$ntomp" -pin on "${GPU_ARGS[@]}" $offload \
+      -nsteps "$BENCH_STEPS" -resetstep "$BENCH_RESET" -noconfout -nstlist 100 >"$d.out" 2>&1
+    rc=$?; set -e
+    if [ $rc -ne 0 ]; then echo "[autotune]   trial $i INVALID (rc=$rc) — skipped"; rm -f "$d".* 2>/dev/null; continue; fi
+    nsday=$(perf_nsday "$d.log"); [ -z "$nsday" ] && nsday=0
+    echo "[autotune]   trial $i -> ${nsday} ns/day"
+    awk -v a="$nsday" -v b="$best_ns" 'BEGIN{exit !(a>b)}' && { best_ns="$nsday"; best_spec="$spec"; }
+    rm -f "$d".* 2>/dev/null || true
+  done
+  if [ -n "$best_spec" ] && awk -v b="$best_ns" 'BEGIN{exit !(b>0)}'; then
+    TUNE_NTOMP="${best_spec%%|*}"; read -r -a TUNE_EXTRA <<< "${best_spec#*|}"
+    { echo "NTOMP=$TUNE_NTOMP"; echo "EXTRA=${TUNE_EXTRA[*]}"; echo "NSDAY=$best_ns"; } > "$STATUS_DIR/TUNED"
+    mark TUNE_DONE
+    echo "[autotune] WINNER: -ntomp $TUNE_NTOMP ${TUNE_EXTRA[*]}  (${best_ns} ns/day)"
+  else
+    echo "[autotune] no valid trial — keeping defaults (-ntomp $TUNE_NTOMP ${TUNE_EXTRA[*]})"
+  fi
+  rm -rf "$TUNE_DIR" 2>/dev/null || true
+}
+
 tpr_end_ps() {            # end time (ps) baked into a tpr = nsteps*dt
   "$GMX" dump -s "$1" 2>/dev/null | awk '
     /^[[:space:]]*nsteps[[:space:]]*=/{ns=$NF}
@@ -191,7 +291,7 @@ run_md_stage() {          # $1 deffnm  $2 mdp  $3 coord  $4(opt) cpt-for-grompp
     if [ -f "${deffnm}.cpt" ]; then
       echo "→ ${deffnm}: resume (pass ${pass})"; resume_stage "$deffnm" || { on_failure; exit 1; }
     else
-      echo "→ ${deffnm}: fresh (pass ${pass})"; mdrun_fresh "$deffnm" "${MD_OFFLOAD[@]}" || { on_failure; exit 1; }
+      echo "→ ${deffnm}: fresh (pass ${pass})"; mdrun_fresh "$deffnm" "${TUNE_EXTRA[@]}" || { on_failure; exit 1; }
     fi
   done
 }
@@ -299,6 +399,8 @@ if [ -f mdp/prod.mdp ]; then
   fi
   echo "[pipeline] production chunk = ${STAGE_NS} ns -> nsteps=${PROD_NSTEPS} (dt=${PROD_DT} ps)"
 fi
+# Pick the fastest mdrun flags for THIS node+system (once; persisted) before producing.
+autotune_mdrun
 # ---- Production (required; chunked) ----
 for i in $(seq 1 "$N_STAGES"); do
   deffnm=$(printf "md_part%02d" "$i")

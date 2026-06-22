@@ -64,6 +64,9 @@ KEEPALIVE_MAXH="${KEEPALIVE_MAXH:-24}"         # node holds itself up this long 
 # the idle-autostop entirely (then ONLY the node keepalive + `watchdog` bound a forgotten node).
 AUTOSTOP_MIN="${AUTOSTOP_MIN:-90}"
 if [ "${AUTOSTOP_MIN:-0}" -gt 0 ] 2>/dev/null; then AUTOSTOP_ARGS="-i ${AUTOSTOP_MIN} --down"; else AUTOSTOP_ARGS=""; fi
+NT="${NT:-}"                                   # OpenMP thread ceiling on the node (blank => auto-detect)
+AUTOTUNE="${AUTOTUNE:-1}"                       # benchmark mdrun flags per node before production
+BENCH_STEPS="${BENCH_STEPS:-4000}"
 PULL_RETRIES="${PULL_RETRIES:-6}"             # verified-pull attempts before giving up
 FORCE="${FORCE:-0}"                           # FORCE=1 bypasses the pull-before-destroy guards
 # DISK_GB: floor it to the solvated run size (~0.45 GB/ns for ~90k-atom boxes) so
@@ -388,6 +391,9 @@ render_yaml() {
       -e "s|@@CKPT_MIN@@|$CKPT_MIN|g" \
       -e "s|@@MAXH_PER_STAGE@@|$MAXH_PER_STAGE|g" \
       -e "s|@@KEEPALIVE_MAXH@@|$KEEPALIVE_MAXH|g" \
+      -e "s|@@NT@@|${NT:-}|g" \
+      -e "s|@@AUTOTUNE@@|${AUTOTUNE:-1}|g" \
+      -e "s|@@BENCH_STEPS@@|${BENCH_STEPS:-4000}|g" \
       -e "s|@@IMAGE_KIND@@|$IMAGE_KIND|g" \
       -e "s|@@CONDA_SPEC@@|$CONDA_SPEC|g" \
       -e "s|@@START_STRUCT@@|${START_STRUCT:-}|g" \
