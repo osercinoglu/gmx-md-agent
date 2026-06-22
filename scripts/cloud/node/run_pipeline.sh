@@ -236,7 +236,11 @@ autotune_mdrun() {
     timeout "$BENCH_BUDGET_S" "$GMX" mdrun -s "$btpr" -deffnm "$d" -ntmpi 1 -ntomp "$ntomp" -pin on "${GPU_ARGS[@]}" $offload \
       -nsteps "$BENCH_STEPS" -resethway -noconfout >"$d.out" 2>&1
     rc=$?; set -e
-    if [ $rc -ne 0 ]; then echo "[autotune]   trial $i INVALID (rc=$rc) — skipped"; rm -f "$d".* 2>/dev/null; continue; fi
+    if [ $rc -ne 0 ]; then
+      echo "[autotune]   trial $i INVALID (rc=$rc) — skipped; mdrun output:"
+      grep -iE 'error|fatal|invalid|cannot|not (found|supported|compatible)|gpu|cuda|assert|abort' "$d.out" 2>/dev/null | tail -6 | sed 's/^/[autotune]       | /'
+      rm -f "$d".* 2>/dev/null; continue
+    fi
     nsday=$(perf_nsday "$d.log"); [ -z "$nsday" ] && nsday=0
     echo "[autotune]   trial $i -> ${nsday} ns/day"
     awk -v a="$nsday" -v b="$best_ns" 'BEGIN{exit !(a>b)}' && { best_ns="$nsday"; best_spec="$spec"; }
