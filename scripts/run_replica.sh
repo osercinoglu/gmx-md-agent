@@ -42,29 +42,32 @@ PUSHOVER_DEVICE="${PUSHOVER_DEVICE:-}"
 # Operate on the REPLICA directory (1st arg, else the current dir) — NOT where
 # this script file happens to live. This lets you run a central copy against a
 # folder (bash /path/run_replica.sh <replica_dir>) or from inside it (cd dir;
-# bash .../run_replica.sh). Helper files (mdp/, pushover.sh, add_chain_ids.py)
-# are taken from the replica dir, falling back to the script's own dir.
+# bash .../run_replica.sh). NOTHING is copied into the replica dir: helper files
+# (mdp/, pushover.sh, add_chain_ids.py) are read from the SCRIPT's own dir, so
+# the script lives in ONE place and runs against any folder of sim inputs.
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 HERE="$(cd "${1:-$PWD}" 2>/dev/null && pwd)" || { echo "ERROR: replica dir '${1:-$PWD}' not found"; exit 1; }
 cd "$HERE"
 REPLICA_TAG="$(basename "$HERE")"
 
 # Guard: refuse to run (and silently "start over") in a non-replica dir.
-if [ ! -f topol.top ] || ! ls solvated_ions.pdb ./*.gro ./*.pdb >/dev/null 2>&1; then
+_have_struct=0
+for _s in solvated_ions.pdb *.gro *.pdb; do [ -f "$_s" ] && { _have_struct=1; break; }; done
+if [ ! -f topol.top ] || [ "$_have_struct" = 0 ]; then
   echo "ERROR: '$HERE' is not a replica dir (need topol.top + a structure .pdb/.gro)."
   echo "  Run from INSIDE a replica dir, or: bash <path>/run_replica.sh <replica_dir>"
   exit 1
 fi
-# Helpers: prefer the replica dir, else copy from the script's dir.
-[ -d mdp ]              || cp -r "$SCRIPT_DIR/mdp" ./mdp        2>/dev/null || true
-[ -f add_chain_ids.py ] || cp    "$SCRIPT_DIR/add_chain_ids.py" .  2>/dev/null || true
-[ -f pushover.sh ]      || cp    "$SCRIPT_DIR/pushover.sh"      .  2>/dev/null || true
+# Central helpers (never copied into the replica dir). mdp: prefer a folder-local
+# mdp/ if one exists (per-replica overrides), else the script's shared mdp/.
+MDP_DIR="$( [ -d "$HERE/mdp" ] && echo "$HERE/mdp" || echo "$SCRIPT_DIR/mdp" )"
+ADD_CHAIN="$SCRIPT_DIR/add_chain_ids.py"
+PUSHOVER_SH="$SCRIPT_DIR/pushover.sh"
 
 RUN_LOG="$HERE/run_replica.log"
 exec > >(tee -a "$RUN_LOG") 2>&1
 
 N_STAGES=$(( TOTAL_NS / STAGE_NS ))     # 15 production parts
-PUSHOVER_SH="$HERE/pushover.sh"
 PUSHOVER_CONFIG="${PUSHOVER_CONFIG:-$HOME/.pushover/pushover-config}"
 
 # Source pushover config (akusei format defines api_token / user_key)
@@ -197,7 +200,7 @@ notify "Run starting: ${TOTAL_NS} ns in ${N_STAGES} stages" "$REPLICA_TAG ▶" 0
 # ---------- 1. Energy minimization ----------
 stage_banner "Energy minimization"
 if [ ! -f em.gro ]; then
-  GROMPP mdp/minim.mdp solvated_ions.pdb em.tpr
+  GROMPP "$MDP_DIR/minim.mdp" solvated_ions.pdb em.tpr
   MDRUN_GPU_EM em
 else
   echo "→ em.gro present, skipping"
@@ -207,7 +210,7 @@ advance $W_MIN
 # ---------- 2. NVT (random gen_seed -> independent replica) ----------
 stage_banner "NVT equilibration (1 ns, fresh velocities)"
 if [ ! -f nvt.gro ]; then
-  GROMPP mdp/nvt.mdp em.gro nvt.tpr
+  GROMPP "$MDP_DIR/nvt.mdp" em.gro nvt.tpr
   MDRUN_GPU nvt
 else
   echo "→ nvt.gro present, skipping"
@@ -217,7 +220,7 @@ advance $W_NVT
 # ---------- 3. NPT ----------
 stage_banner "NPT equilibration (1 ns)"
 if [ ! -f npt.gro ]; then
-  GROMPP mdp/npt.mdp nvt.gro npt.tpr nvt.cpt
+  GROMPP "$MDP_DIR/npt.mdp" nvt.gro npt.tpr nvt.cpt
   MDRUN_GPU npt
 else
   echo "→ npt.gro present, skipping"
@@ -231,7 +234,7 @@ for i in $(seq 1 "$N_STAGES"); do
   deffnm=$(printf "md_part%02d" "$i")
   stage_banner "Production ${i}/${N_STAGES} (50 ns) — ${deffnm}"
   if [ ! -f "${deffnm}.gro" ]; then
-    GROMPP mdp/md_50ns.mdp "$prev_gro" "${deffnm}.tpr" "$prev_cpt"
+    GROMPP "$MDP_DIR/md_50ns.mdp" "$prev_gro" "${deffnm}.tpr" "$prev_cpt"
     MDRUN_GPU "$deffnm"
   else
     echo "→ ${deffnm}.gro present, skipping"
@@ -308,8 +311,8 @@ printf "4\n0\n" | "$GMX" trjconv -s prod_dry.tpr -f .dryan/center.xtc -o prod_dr
 # Reference (frame 0) + final-frame PDB from the dry trajectory, stamp chain IDs.
 echo 0 | "$GMX" trjconv -s prod_dry.tpr -f prod_dry.xtc -o prod_ref.pdb  -dump 0          -conect
 echo 0 | "$GMX" trjconv -s prod_dry.tpr -f prod_dry.xtc -o prod_last.pdb -dump 999999999  -conect
-python3 add_chain_ids.py prod_ref.pdb  topol_Protein_chain_A.itp topol_Protein_chain_B.itp topol_Protein_chain_C.itp
-python3 add_chain_ids.py prod_last.pdb topol_Protein_chain_A.itp topol_Protein_chain_B.itp topol_Protein_chain_C.itp
+python3 "$ADD_CHAIN" prod_ref.pdb  topol_Protein_chain_A.itp topol_Protein_chain_B.itp topol_Protein_chain_C.itp
+python3 "$ADD_CHAIN" prod_last.pdb topol_Protein_chain_A.itp topol_Protein_chain_B.itp topol_Protein_chain_C.itp
 
 # Drop all intermediates; keep only the dry deliverables. Raw chunks untouched.
 rm -rf .dryan
