@@ -271,6 +271,23 @@ if [ -f mdp/npt.mdp ]; then
   run_md_stage npt mdp/npt.mdp "$prev_gro" "$prev_cpt"
   mark NPT_DONE; prev_gro="$(latest_gro npt)"; prev_cpt="npt.cpt"
 fi
+# ---- Production chunk length is driven by --stage-ns (single source of truth) ----
+# Override prod.mdp's nsteps so each chunk is EXACTLY STAGE_NS ns (computed from the
+# mdp's own dt). This removes the foot-gun where chunk length silently depended on
+# whatever nsteps the prod mdp carried, makes per-chunk progress/notifications exact,
+# and matches extend mode (which is already stage-ns-driven via convert-tpr -until).
+# Operates on the staged COPY mdp/prod.mdp — never the user's source mdp.
+if [ -f mdp/prod.mdp ]; then
+  PROD_DT=$(awk -F= '/^[[:space:]]*dt[[:space:]]*=/{gsub(/[^0-9.eE+-]/,"",$2); print $2; exit}' mdp/prod.mdp)
+  PROD_DT=${PROD_DT:-0.001}   # GROMACS default dt when the mdp omits it
+  PROD_NSTEPS=$(awk -v ns="$STAGE_NS" -v dt="$PROD_DT" 'BEGIN{printf "%.0f", (ns*1000.0)/dt}')
+  if grep -qE '^[[:space:]]*nsteps[[:space:]]*=' mdp/prod.mdp; then
+    sed -i -E "s|^([[:space:]]*nsteps[[:space:]]*=).*|\1 ${PROD_NSTEPS}   ; set by --stage-ns=${STAGE_NS} ns (dt=${PROD_DT})|" mdp/prod.mdp
+  else
+    printf 'nsteps = %s   ; set by --stage-ns=%s ns (dt=%s)\n' "$PROD_NSTEPS" "$STAGE_NS" "$PROD_DT" >> mdp/prod.mdp
+  fi
+  echo "[pipeline] production chunk = ${STAGE_NS} ns -> nsteps=${PROD_NSTEPS} (dt=${PROD_DT} ps)"
+fi
 # ---- Production (required; chunked) ----
 for i in $(seq 1 "$N_STAGES"); do
   deffnm=$(printf "md_part%02d" "$i")

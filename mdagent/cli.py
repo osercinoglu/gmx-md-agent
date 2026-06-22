@@ -220,11 +220,15 @@ def add_inputs(sp):
     sp.add_argument("--top", default="topol.top", help="topology file (default topol.top)")
     sp.add_argument("--index", default="index.ndx", help="index file (used if present; default index.ndx)")
     sp.add_argument("--total-ns", type=float, default=750, help="total production ns (default 750)")
-    sp.add_argument("--stage-ns", type=float, default=50, help="ns per chunk (default 50)")
+    sp.add_argument("--stage-ns", type=float, default=50,
+                    help="ns per production chunk (default 50); this SETS each chunk's length "
+                         "(overrides the prod mdp's nsteps via the mdp's dt)")
     sp.add_argument("--ckpt-min", type=int, default=15, help="checkpoint cadence, minutes")
     sp.add_argument("--maxh", type=float, default=48, help="mdrun -maxh per chunk")
     sp.add_argument("--maxwarn", type=int, default=1, help="grompp -maxwarn")
-    sp.add_argument("--prod-mdp", default=None, help="production mdp (REQUIRED for a fresh run)")
+    sp.add_argument("--prod-mdp", default=None,
+                    help="production mdp (REQUIRED for a fresh run); provides integrator/dt/"
+                         "coupling/output — its nsteps is OVERRIDDEN to match --stage-ns")
     sp.add_argument("--em-mdp", default=None, help="energy-minimization mdp (optional phase)")
     sp.add_argument("--nvt-mdp", default=None, help="NVT mdp (optional phase)")
     sp.add_argument("--npt-mdp", default=None, help="NPT mdp (optional phase)")

@@ -35,7 +35,18 @@ for pair in \
   [ -e "${pair%%:*}" ] && mounts+=(-v "$pair")
 done
 
+# Forward run-tuning env vars into the container when set on the host, e.g.
+#   VAST_MAX_DPH=0.40 ./mda cloud ...   (per-GPU price ceiling, patch-enforced)
+# VAST_MAX_DPH: hard $/hr ceiling on the chosen Vast offer (the baked-in provisioner
+#               patch honors it); MAX_HOURLY: offer-browser cost cap (0=no cap);
+# KEEPALIVE_MAXH: hours a node holds itself up awaiting a verified pull;
+# GMX_MAX_SM_MAJOR: max GPU compute-capability major the node GROMACS supports (9 for 2024.2).
+env_args=()
+for v in VAST_MAX_DPH MAX_HOURLY KEEPALIVE_MAXH GMX_MAX_SM_MAJOR GMX_CONDA_SPEC VAST_API_KEY PUSHOVER_TOKEN PUSHOVER_USER; do
+  [ -n "${!v:-}" ] && env_args+=(-e "$v=${!v}")
+done
+
 mode=(--rm -it)
 [ "${MDAGENT_DETACH:-0}" = "1" ] && mode=(--rm -d)
 
-exec docker run "${mode[@]}" "${gpu_args[@]}" "${mounts[@]}" "$IMAGE" "$@"
+exec docker run "${mode[@]}" "${gpu_args[@]}" "${env_args[@]}" "${mounts[@]}" "$IMAGE" "$@"
