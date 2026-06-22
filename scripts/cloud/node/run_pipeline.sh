@@ -229,8 +229,12 @@ autotune_mdrun() {
     ntomp="${spec%%|*}"; offload="${spec#*|}"; d="$TUNE_DIR/t$i"
     echo "[autotune] trial $i: -ntomp $ntomp $offload"
     set +e
+    # -resethway discards warmup (PME tune + CUDA JIT) by resetting perf counters at the
+    # halfway step — always valid, unlike -resetstep <n> which FATALs if the bench tpr's
+    # start step is already past <n>. Do NOT force -nstlist (keep the tpr's Verlet value);
+    # overriding both was making every trial exit rc=1 (validated in a live smoke test).
     timeout "$BENCH_BUDGET_S" "$GMX" mdrun -s "$btpr" -deffnm "$d" -ntmpi 1 -ntomp "$ntomp" -pin on "${GPU_ARGS[@]}" $offload \
-      -nsteps "$BENCH_STEPS" -resetstep "$BENCH_RESET" -noconfout -nstlist 100 >"$d.out" 2>&1
+      -nsteps "$BENCH_STEPS" -resethway -noconfout >"$d.out" 2>&1
     rc=$?; set -e
     if [ $rc -ne 0 ]; then echo "[autotune]   trial $i INVALID (rc=$rc) — skipped"; rm -f "$d".* 2>/dev/null; continue; fi
     nsday=$(perf_nsday "$d.log"); [ -z "$nsday" ] && nsday=0
