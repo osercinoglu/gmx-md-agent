@@ -48,7 +48,15 @@ CONDA_SPEC="${CONDA_SPEC:-gromacs=2024.2=nompi_cuda_*}"
 TOTAL_NS="${TOTAL_NS:-750}"; STAGE_NS="${STAGE_NS:-50}"
 CKPT_MIN="${CKPT_MIN:-15}";  SYNC_MIN="${SYNC_MIN:-15}"   # SYNC_MIN = local pull cadence
 MAXH_PER_STAGE="${MAXH_PER_STAGE:-48}"; MAX_RESTARTS="${MAX_RESTARTS:-10}"
-DISK_GB="${DISK_GB:-100}"
+KEEPALIVE_MAXH="${KEEPALIVE_MAXH:-12}"         # node holds itself up this long awaiting a verified pull
+                                              # (covers an overnight-offline supervisor; pair with `watchdog`)
+PULL_RETRIES="${PULL_RETRIES:-6}"             # verified-pull attempts before giving up
+FORCE="${FORCE:-0}"                           # FORCE=1 bypasses the pull-before-destroy guards
+# DISK_GB: floor it to the solvated run size (~0.45 GB/ns for ~90k-atom boxes) so
+# the node can't fill mid-run; a larger user override still wins.
+if [ -z "${DISK_GB:-}" ]; then
+  DISK_GB=$(awk -v t="${TOTAL_NS:-750}" 'BEGIN{d=100+t*0.45; if(d<100)d=100; printf "%d", d}')
+fi
 PROD_MDP="${PROD_MDP:-}"                       # production mdp (required for a fresh run)
 EM_MDP="${EM_MDP:-}"; NVT_MDP="${NVT_MDP:-}"; NPT_MDP="${NPT_MDP:-}"   # optional phases
 START_STRUCT="${START_STRUCT:-}"              # starting structure (auto-detected on node if unset)
@@ -71,9 +79,18 @@ INPUT_GLOBS=(*.gro *.pdb *.top *.itp *.ndx *.cpt)
 
 resolve_dir() { local d="${1:-$PWD}"; (cd "$d" && pwd); }
 tag_of()      { basename "$1"; }
-# SkyPilot cluster names (and thus the ssh alias used for rsync) must be
-# lowercase [a-z0-9-]; sanitize the replica tag accordingly.
-jobname_of()  { echo "gmx-$(tag_of "$1")" | tr 'A-Z_' 'a-z-' | tr -cd 'a-z0-9-'; }
+# SkyPilot cluster names (== the ssh alias used for rsync) must be lowercase
+# [a-z0-9-]. Sanitizing the basename alone collides (AII_C_14_02_1 vs
+# AII-C-14-02-1, case folds, etc.) and two replicas would share/clobber one
+# cluster + cross-contaminate pulls. Append a stable hash of the ABSOLUTE path so
+# each distinct folder gets a unique, reproducible cluster name.
+jobname_of() {
+  local d base h
+  d="$(cd "$1" 2>/dev/null && pwd || echo "$1")"
+  base="$(echo "gmx-$(basename "$d")" | tr 'A-Z_' 'a-z-' | tr -cd 'a-z0-9-')"
+  h="$(printf '%s' "$d" | cksum | cut -d' ' -f1)"
+  echo "${base}-$(printf '%x' "$h")"
+}
 
 stage_dir() { echo "$1/.cloud_run"; }
 store_dir() { echo "$1/.cloud_state"; }
@@ -312,6 +329,7 @@ render_yaml() {
       -e "s|@@STAGE_NS@@|$STAGE_NS|g" \
       -e "s|@@CKPT_MIN@@|$CKPT_MIN|g" \
       -e "s|@@MAXH_PER_STAGE@@|$MAXH_PER_STAGE|g" \
+      -e "s|@@KEEPALIVE_MAXH@@|$KEEPALIVE_MAXH|g" \
       -e "s|@@IMAGE_KIND@@|$IMAGE_KIND|g" \
       -e "s|@@CONDA_SPEC@@|$CONDA_SPEC|g" \
       -e "s|@@START_STRUCT@@|${START_STRUCT:-}|g" \
@@ -341,20 +359,90 @@ pull_state() {
     --include='*.tpr' --include='*.cpt' \
     --include='em.gro' --include='nvt.gro' --include='nvt.cpt' \
     --include='npt.gro' --include='npt.cpt' \
-    --include='md_part*.gro' --include='md_part*.edr' --include='md_part*.log' \
-    --include='md_ext*.gro' --include='md_ext*.edr' --include='md_ext*.log' \
+    --include='md_part*.gro' --include='md_ext*.gro' \
+    --include='*.edr' --include='*.log' --include='*.mdp' \
     --include='run_pipeline.log' \
     --exclude='*' \
     "$JOB:sky_workdir/" "$STORE/"
   rc=$?
   set -e
-  # Pass B: append-only trajectories (large) — best effort, --append.
+  # Pass B: append-only trajectories (large) — best effort, --append (safe because
+  # the node always resumes with -noappend, so .xtc are strictly append-only).
   if [ "$rc" -eq 0 ]; then
     rsync -az --partial --append --timeout=120 -e "$SSH_OPTS" --prune-empty-dirs \
       --include='md_part*.xtc' --include='md_ext*.xtc' --exclude='*' \
       "$JOB:sky_workdir/" "$STORE/" || true
   fi
   return "$rc"
+}
+
+# SSH-list the node's trajectory files with sizes; rc!=0 => node unreachable.
+remote_xtc_sizes() {
+  $SSH_OPTS "$1" 'cd sky_workdir 2>/dev/null && stat -c "%s %n" md_part*.xtc md_ext*.xtc 2>/dev/null' 2>/dev/null
+}
+# Tell the node its data is safely local (releases its keepalive hold).
+mark_pulled_ok() { $SSH_OPTS "$1" 'mkdir -p sky_workdir/status && touch sky_workdir/status/PULLED_OK' 2>/dev/null || true; }
+
+# Pull, then VERIFY every trajectory chunk on the node is fully present locally
+# (local size >= node size). Loops up to PULL_RETRIES; an --append-verify pass
+# repairs any short/partial local file. Returns: 0 = verified complete,
+# 1 = still incomplete after retries, 2 = node unreachable (cannot verify).
+pull_verified() {
+  local JOB="$1" STORE="$2" i listing lrc mism name sz lf lsz
+  for (( i=1; i<=PULL_RETRIES; i++ )); do
+    pull_state "$JOB" "$STORE" || true
+    rsync -az --partial --append-verify --timeout=300 -e "$SSH_OPTS" --prune-empty-dirs \
+      --include='md_part*.xtc' --include='md_ext*.xtc' --exclude='*' \
+      "$JOB:sky_workdir/" "$STORE/" 2>/dev/null || true
+    set +e; listing="$(remote_xtc_sizes "$JOB")"; lrc=$?; set -e
+    [ "$lrc" -ne 0 ] && { echo "[pull_verified] node unreachable — cannot verify"; return 2; }
+    mism=0
+    while read -r sz name; do
+      [ -n "${name:-}" ] || continue
+      lf="$STORE/$name"; lsz=$(stat -c %s "$lf" 2>/dev/null || echo 0)
+      [ "$lsz" -lt "$sz" ] && { mism=1; echo "[pull_verified] $name: local $lsz < node $sz"; }
+    done <<< "$listing"
+    [ "$mism" -eq 0 ] && { echo "[pull_verified] all trajectory chunks verified complete locally"; return 0; }
+    echo "[pull_verified] incomplete (attempt $i/$PULL_RETRIES) — re-pulling…"; sleep 10
+  done
+  return 1
+}
+
+# Is this job's Vast instance still present on the account?
+instance_present() { [ "$(vast_desc "$1")" != "vast#?" ]; }
+
+# Destroy ONLY this job's Vast instance (scoped — never touches other replicas).
+destroy_this_job_instance() {
+  local id; id="$(vast_desc "$1")"; id="${id#vast#}"; id="${id%%/*}"
+  if [ -n "$id" ] && [ "$id" != "?" ]; then
+    echo ">> destroying this job's Vast instance $id"; "$VASTAI" destroy instance "$id" -y || true
+  else
+    echo ">> no live Vast instance for $1 (already gone)"
+  fi
+}
+
+# Refuse to launch over a cluster of the same name that is already UP (double
+# launch / would clobber a running node). FORCE=1 overrides.
+assert_cluster_free() {
+  local JOB="$1"
+  if "$SKY" status "$JOB" 2>/dev/null | grep -qiE '\bUP\b|\bINIT\b'; then
+    [ "$FORCE" = "1" ] || die "cluster '$JOB' is already UP — teardown first (or FORCE=1). Refusing to launch over a running node."
+  fi
+}
+
+# Reset the local store for a fresh run WITHOUT destroying the only copy of
+# pulled-but-unanalyzed chunks: if such data exists, move it aside instead of rm.
+safe_reset_store() {
+  local STORE="$1" f have=0
+  for f in "$STORE"/md_part*.xtc "$STORE"/md_ext*.xtc; do [ -f "$f" ] && { have=1; break; }; done
+  if [ "$have" = 1 ] && [ ! -f "$STORE/prod_dry.xtc" ] && [ "$FORCE" != "1" ]; then
+    local bak="${STORE}.bak-$(date +%Y%m%d-%H%M%S)"
+    mv "$STORE" "$bak"
+    echo ">> NOTE: prior un-analyzed chunks present — moved $STORE -> $bak (FORCE=1 to delete instead)."
+  else
+    rm -rf "$STORE"
+  fi
+  mkdir -p "$STORE"
 }
 
 # Drop saved state back into the staged workdir for a recovery launch. We push
@@ -437,7 +525,7 @@ cmd_launch() {
   echo "   estimated ~\$$SEL_EST_TOTAL over ~$SEL_EST_DAYS days for $TOTAL_NS ns"
 
   local STORE; STORE="$(store_dir "$REPLICA_DIR")"
-  rm -rf "$STORE"; mkdir -p "$STORE"   # fresh run: clear stale markers/trajectory from any prior run
+  safe_reset_store "$STORE"            # fresh run, but never delete un-analyzed chunks
   stage_workdir "$REPLICA_DIR"
   render_yaml "$REPLICA_DIR"
   say "Rendered job spec: $STAGE/gromacs_md.sky.yaml"
@@ -449,10 +537,12 @@ cmd_launch() {
     return 0
   fi
 
+  assert_cluster_free "$JOB"
   say "Provisioning Vast.ai node + installing GROMACS (this can take a few minutes)…"
-  # Cluster mode (not managed jobs): recovery is local-driven. -i/--down is a
-  # backstop — if this machine ever dies, the node self-terminates after it goes
-  # idle (i.e. once the run ends or crashes), so nothing bills indefinitely.
+  # Cluster mode (recovery is local-driven). -i 30 --down is only a billing
+  # backstop; data safety does NOT depend on it — the node holds itself up
+  # (KEEPALIVE_MAXH) until the supervisor confirms a verified pull, and teardown
+  # only happens after that verified pull.
   ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run -i 30 --down ) \
     || die "sky launch failed — check the output above."
 
@@ -476,7 +566,10 @@ cmd_launch() {
   echo "   teardown : $0 teardown $REPLICA_DIR"
   echo " Outputs are pulled into $(store_dir "$REPLICA_DIR")/ as stages finish;"
   echo " final prod*.xtc / prod_*.pdb are written to $REPLICA_DIR/ at the end."
-  echo " This machine should stay online; the supervisor survives terminal close."
+  echo " Keep this machine online; supervisor survives terminal close. The node holds"
+  echo " itself up (~${KEEPALIVE_MAXH}h) until a verified pull, so a brief outage won't lose data."
+  echo " For long runs, auto-restart a dead supervisor via cron:"
+  echo "   */10 * * * * bash $0 watchdog $REPLICA_DIR"
   echo "============================================================"
 }
 
@@ -504,7 +597,12 @@ cmd_extend() {
   echo "Extend base    : $EXT_BASE     cluster/job: $JOB"
   [ -f "$btpr" ] || die "missing $btpr"
   [ -f "$bcpt" ] || die "missing $bcpt"
-  [ -f "$bxtc" ] || echo ">> WARNING: $bxtc not found — the final prod.xtc will contain only the NEW segment."
+  # The original segment lives ONLY in $bxtc; without it the final trajectory
+  # would silently contain only the extension. Hard-error unless explicitly opted out.
+  if [ ! -f "$bxtc" ]; then
+    [ "${NEW_SEGMENT_ONLY:-0}" = "1" ] || die "missing $bxtc — the original segment would be dropped. Provide it, or set NEW_SEGMENT_ONLY=1 to intentionally keep only the new segment."
+    echo ">> NEW_SEGMENT_ONLY=1 — proceeding; final trajectory will contain only the NEW segment."
+  fi
 
   say "Bootstrap (tools + Vast key + local gmx)"
   ensure_tools; ensure_vast_key
@@ -537,7 +635,7 @@ cmd_extend() {
   source "$HERE/cloud_selection.env"
   echo ">> selection: GPU=$SEL_ACCEL spot=$SEL_USE_SPOT max\$/hr=$SEL_MAX_HOURLY"
 
-  rm -rf "$STORE"; mkdir -p "$STORE"   # fresh extension: clear stale markers/chunks from any prior run
+  safe_reset_store "$STORE"            # fresh extension, but never delete un-analyzed chunks
   stage_workdir "$REPLICA_DIR" extend
   render_yaml "$REPLICA_DIR"
   { echo "EXTEND_BASE=\"$EXT_BASE\""
@@ -553,6 +651,7 @@ cmd_extend() {
     return 0
   fi
 
+  assert_cluster_free "$JOB"
   say "Provisioning Vast.ai node + installing GROMACS…"
   ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run -i 30 --down ) \
     || die "sky launch failed — check the output above."
@@ -635,15 +734,21 @@ cmd_supervise() {
 
     # terminal states (read from pulled markers)
     if [ -f "$STORE/status/ALL_DONE" ]; then
-      say "Production complete on node. Final pull + local analysis."
-      pull_state "$JOB" "$STORE" || true
+      say "Production complete on node. VERIFIED final pull, then local analysis."
+      if pull_verified "$JOB" "$STORE"; then
+        mark_pulled_ok "$JOB"     # release the node's keepalive — we have everything
+      else
+        notify "$TAG ⚠ production done but final pull NOT verified complete — node LEFT UP, not torn down" "$TAG ⚠" 1
+        echo "[$(date '+%F %T')] verified final pull FAILED — leaving node up (data still on it). Inspect/retry; FORCE=1 teardown to override."
+        return 1
+      fi
       notify "$TAG: ${STAGE_WORD} done — running local analysis — $(progress_str "$STORE" "$N_STAGES" 0 "$MODE")" "$TAG ▣" 0
       if run_local_analysis "$REPLICA_DIR"; then
         notify "$TAG ✅ DONE — analysis ready in $(basename "$REPLICA_DIR") — $(progress_str "$STORE" "$N_STAGES" 1 "$MODE")" "$TAG ✅" 0
         echo "[$(date '+%F %T')] DONE — prod*.xtc / prod_*.pdb in $REPLICA_DIR"
       else
-        notify "$TAG ⚠ production done but local analysis failed — see supervisor log" "$TAG ⚠" 1
-        echo "[$(date '+%F %T')] analysis FAILED — node left up for inspection; not tearing down."
+        notify "$TAG ⚠ data is SAFE locally but local analysis failed — re-run analysis locally on .cloud_state" "$TAG ⚠" 1
+        echo "[$(date '+%F %T')] analysis FAILED (raw chunks are verified-local); node released."
         return 1
       fi
       teardown_cluster "$REPLICA_DIR"
@@ -651,28 +756,41 @@ cmd_supervise() {
     fi
     if [ -f "$STORE/status/FAILED" ]; then
       local where; where="$(cat "$STORE/status/FAILED" 2>/dev/null || echo '?')"
-      notify "$TAG ❌ node reported FAILURE at: $where (no auto-retry — gmx error)" "$TAG ❌" 1
-      echo "[$(date '+%F %T')] node FAILED at: $where — leaving node up for inspection."
+      say "Node reported FAILURE at: $where — pulling failure-time data (verified) first."
+      pull_verified "$JOB" "$STORE" || echo "[$(date '+%F %T')] WARN: failure-time pull not fully verified"
+      notify "$TAG ❌ node FAILED at: $where — data pulled to .cloud_state; node left up (~${KEEPALIVE_MAXH}h) for inspection" "$TAG ❌" 1
+      echo "[$(date '+%F %T')] node FAILED at: $where — data pulled; node left up, auto-stops after keepalive."
       return 1
     fi
 
-    # recover a dead node (only on repeated connection failure, not a gmx error)
+    # Suspected dead node. NEVER destroy a node that might still hold unpulled data:
+    # verify reachability + completeness first; only down+relaunch if truly gone.
     if [ "$fails" -ge 3 ]; then
-      if [ "$restarts" -ge "$MAX_RESTARTS" ]; then
-        notify "$TAG ❌ node unreachable and max restarts ($MAX_RESTARTS) exhausted" "$TAG ❌" 1
-        die "exhausted $MAX_RESTARTS restarts; giving up. Inspect: $SKY status ; vastai show instances"
-      fi
-      restarts=$((restarts+1))
-      notify "$TAG ↻ node unreachable — recovering (restart $restarts/$MAX_RESTARTS)" "$TAG ↻" 1
-      echo "[$(date '+%F %T')] recovering: sky down + restage state + relaunch ($restarts/$MAX_RESTARTS)"
-      "$SKY" down -y "$JOB" >/dev/null 2>&1 || true
-      VAST_ID=""    # new instance after relaunch — force re-resolve next cycle
-      restage_state "$STORE" "$STAGE"
-      if ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run -i 30 --down ); then
-        echo "[$(date '+%F %T')] relaunched $JOB; resuming pulls"
-        fails=0
+      local pvrc
+      if pull_verified "$JOB" "$STORE"; then pvrc=0; else pvrc=$?; fi
+      if [ "$pvrc" -eq 0 ]; then
+        echo "[$(date '+%F %T')] node reachable + data verified after $fails misses — false alarm, continuing"; fails=0
+      elif [ "$pvrc" -eq 1 ]; then
+        notify "$TAG ⚠ node reachable but pull not yet complete — retrying, NOT destroying" "$TAG ⚠" 1
+        echo "[$(date '+%F %T')] node alive but pull incomplete; keep retrying (no teardown)"
+      elif instance_present "$JOB"; then
+        notify "$TAG ⚠ node unreachable but still PRESENT — NOT destroying (unpulled data may be on it)" "$TAG ⚠" 1
+        echo "[$(date '+%F %T')] instance present but unreachable; refusing teardown to avoid data loss"
       else
-        echo "[$(date '+%F %T')] relaunch failed; will retry next cycle"
+        if [ "$restarts" -ge "$MAX_RESTARTS" ]; then
+          notify "$TAG ❌ node gone and max restarts ($MAX_RESTARTS) exhausted" "$TAG ❌" 1
+          die "exhausted $MAX_RESTARTS restarts; giving up. Inspect: $SKY status ; vastai show instances"
+        fi
+        restarts=$((restarts+1))
+        notify "$TAG ↻ node confirmed gone — recovering (restart $restarts/$MAX_RESTARTS)" "$TAG ↻" 1
+        echo "[$(date '+%F %T')] node confirmed gone: sky down + restage + relaunch ($restarts/$MAX_RESTARTS)"
+        "$SKY" down -y "$JOB" >/dev/null 2>&1 || true
+        VAST_ID=""; restage_state "$STORE" "$STAGE"
+        if ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run -i 30 --down ); then
+          echo "[$(date '+%F %T')] relaunched $JOB; resuming pulls"; fails=0
+        else
+          echo "[$(date '+%F %T')] relaunch failed; will retry next cycle"
+        fi
       fi
     fi
 
@@ -719,23 +837,52 @@ teardown_cluster() {
 }
 
 cmd_teardown() {
-  local REPLICA_DIR JOB SUPPID; REPLICA_DIR="$(resolve_dir "${1:-$PWD}")"
-  JOB="$(jobname_of "$REPLICA_DIR")"; SUPPID="$(suppid_of "$REPLICA_DIR")"
+  local REPLICA_DIR JOB STORE SUPPID; REPLICA_DIR="$(resolve_dir "${1:-$PWD}")"
+  JOB="$(jobname_of "$REPLICA_DIR")"; STORE="$(store_dir "$REPLICA_DIR")"; SUPPID="$(suppid_of "$REPLICA_DIR")"
+  # SAFETY: verify all trajectory is local BEFORE destroying anything. This is the
+  # main guard against a manual teardown stranding unpulled data on the node.
+  if [ "$FORCE" != "1" ]; then
+    say "Verified pull before teardown (set FORCE=1 to skip)…"
+    if pull_verified "$JOB" "$STORE"; then
+      ok "all trajectory verified local — safe to tear down"
+    else
+      die "final pull NOT verified complete — REFUSING to destroy the node (data may still be on it).
+  Re-run teardown when the node is reachable, or 'FORCE=1 ... teardown' to destroy anyway."
+    fi
+  else
+    say "FORCE=1 — skipping the pre-teardown verified pull"
+  fi
   if [ -f "$SUPPID" ] && kill -0 "$(cat "$SUPPID")" 2>/dev/null; then
     say "Stopping supervisor (PID $(cat "$SUPPID"))"; kill "$(cat "$SUPPID")" 2>/dev/null || true
   fi
   rm -f "$SUPPID" 2>/dev/null || true
-  say "sky down $JOB (terminates the Vast instance)"
+  say "sky down $JOB (terminates THIS job's Vast instance)"
   teardown_cluster "$REPLICA_DIR"
+  destroy_this_job_instance "$JOB"     # scoped belt-and-suspenders; never other jobs
   echo ">> Current Vast instances:"; "$VASTAI" show instances 2>/dev/null || true
-  if [ "${SWEEP:-0}" = "1" ]; then
-    say "SWEEP=1: destroying ALL Vast instances on your account (every instance, not just this job)"
+  if [ "${NUKE_ALL:-0}" = "1" ]; then
+    say "NUKE_ALL=1: destroying EVERY Vast instance on the account (DANGER — affects other replicas)"
     "$VASTAI" show instances --raw 2>/dev/null | python3 -c 'import sys,json;[print(o["id"]) for o in json.load(sys.stdin)]' \
       | xargs -r -n1 -I{} "$VASTAI" destroy instance {} -y
     echo ">> Remaining:"; "$VASTAI" show instances 2>/dev/null || true
-  else
-    echo ">> (SWEEP=1 force-destroys ALL Vast instances on your account as a last resort.)"
   fi
+}
+
+# ============================ watchdog ========================================
+# Re-spawn the supervisor if it's not running. Idempotent — safe to run from cron
+# so a dead supervisor (laptop sleep/reboot/OOM) is restarted before the node's
+# KEEPALIVE_MAXH window elapses. A re-attached supervisor replays no milestones.
+#   */10 * * * * bash <runner> watchdog <REPLICA_DIR>   # in your crontab
+cmd_watchdog() {
+  local REPLICA_DIR JOB SUPPID SUPLOG; REPLICA_DIR="$(resolve_dir "${1:-$PWD}")"
+  JOB="$(jobname_of "$REPLICA_DIR")"; SUPPID="$(suppid_of "$REPLICA_DIR")"; SUPLOG="$(suplog_of "$REPLICA_DIR")"
+  if [ -f "$SUPPID" ] && kill -0 "$(cat "$SUPPID")" 2>/dev/null; then
+    echo "[$(date '+%F %T')] supervisor alive (PID $(cat "$SUPPID"))"; return 0
+  fi
+  [ -f "$(stage_dir "$REPLICA_DIR")/gromacs_md.sky.yaml" ] || { echo "no launched run here — nothing to watch"; return 0; }
+  echo "[$(date '+%F %T')] supervisor DOWN — respawning"
+  nohup bash "$0" supervise "$REPLICA_DIR" >>"$SUPLOG" 2>&1 &
+  echo $! > "$SUPPID"; echo "respawned supervisor PID $(cat "$SUPPID")"
 }
 
 # ============================ dispatch ========================================
@@ -744,9 +891,10 @@ case "$SUB" in
   launch)    cmd_launch    "$@" ;;
   extend)    cmd_extend    "$@" ;;
   supervise) cmd_supervise "$@" ;;
+  watchdog)  cmd_watchdog  "$@" ;;
   follow)    cmd_follow    "$@" ;;
   status)    cmd_status    "$@" ;;
   fetch)     cmd_fetch     "$@" ;;
   teardown)  cmd_teardown  "$@" ;;
-  *) echo "usage: $0 {launch|extend|supervise|follow|status|fetch|teardown} [REPLICA_DIR]"; echo "  extend: EXTEND_FROM=<base> EXTEND_TO_NS=<ns>|EXTEND_BY_NS=<ns> $0 extend [DIR]"; exit 1 ;;
+  *) echo "usage: $0 {launch|extend|supervise|watchdog|follow|status|fetch|teardown} [REPLICA_DIR]"; echo "  extend: EXTEND_FROM=<base> EXTEND_TO_NS=<ns>|EXTEND_BY_NS=<ns> $0 extend [DIR]"; exit 1 ;;
 esac

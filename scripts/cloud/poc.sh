@@ -108,8 +108,8 @@ verify_results() {
 }
 
 teardown() {
-  say "Teardown + lingering-instance sweep"
-  SWEEP=1 bash "$RUNNER" teardown "$POC_DIR" || true
+  say "Teardown (scoped to this POC job; FORCE skips the verified-pull guard — it's a throwaway)"
+  FORCE=1 bash "$RUNNER" teardown "$POC_DIR" || true
   local left; left="$($VASTAI show instances --raw 2>/dev/null | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))' 2>/dev/null || echo '?')"
   [ "$left" = 0 ] && ok "no Vast instances remain (nothing billable)" || bad "Vast instances still present: $left — check: vastai show instances"
 }

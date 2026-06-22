@@ -41,6 +41,12 @@ INDEX="${INDEX:-index.ndx}"
 START_STRUCT="${START_STRUCT:-}"
 EXTEND_BASE="${EXTEND_BASE:-}"
 EXTEND_TO_PS="${EXTEND_TO_PS:-}"
+KEEPALIVE_MAXH="${KEEPALIVE_MAXH:-6}"    # after outputs are done/failed, hold the
+                                         # instance up (non-idle) this many hours
+                                         # waiting for the supervisor to confirm a
+                                         # verified pull (status/PULLED_OK), so the
+                                         # node never idles into -i --down before
+                                         # its data is safely local.
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 cd "$HERE"
@@ -55,6 +61,23 @@ STATUS_DIR="$HERE/status"; mkdir -p "$STATUS_DIR"
 mark()      { printf '%s\n' "$(date '+%F %T')" > "$STATUS_DIR/$1"; }
 clear_mark(){ rm -f "$STATUS_DIR/$1" 2>/dev/null || true; }
 
+# Hold the instance UP (process alive => SkyPilot cluster not idle => -i --down
+# cannot terminate it) until the local supervisor confirms a verified pull by
+# writing status/PULLED_OK back into this workdir, or a billing cap elapses.
+# This is the core guarantee that no trajectory dies on the node before it is
+# safely on the local store. The supervisor sky-down's the node on success.
+wait_for_pull() {
+  local maxs=$(( KEEPALIVE_MAXH * 3600 )) t=0
+  echo "[node] outputs complete — holding instance up for the supervisor's verified pull"
+  echo "[node]   (waiting for status/PULLED_OK, billing cap ${KEEPALIVE_MAXH}h)"
+  while [ ! -f "$STATUS_DIR/PULLED_OK" ] && [ "$t" -lt "$maxs" ]; do sleep 30; t=$((t+30)); done
+  if [ -f "$STATUS_DIR/PULLED_OK" ]; then
+    echo "[node] PULLED_OK received — data confirmed local; exiting cleanly."
+  else
+    echo "[node] keepalive cap (${KEEPALIVE_MAXH}h) reached without PULLED_OK — exiting (supervisor offline?)."
+  fi
+}
+
 STAGE_NAME="(init)"
 stage_banner() {
   STAGE_NAME="$1"
@@ -68,6 +91,9 @@ on_failure() {
   echo "[$(date '+%F %T')] FAILED at stage: $STAGE_NAME"
   echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
   printf '%s\n' "$STAGE_NAME" > "$STATUS_DIR/FAILED"
+  # Hold the failed node up so the supervisor can pull the failure-time data
+  # (checkpoints/partial trajectory) before anything terminates it.
+  wait_for_pull
 }
 trap 'on_failure' ERR
 
@@ -127,14 +153,12 @@ latest_gro() {
 resume_stage() {
   local d="$1" rc
   set +e
-  if [ ! -f "${d}.log" ] && [ ! -f "${d}.edr" ]; then
-    echo "→ ${d}: cross-node resume (no append targets) — -noappend"
-    mdrun_resume_noappend "$d" "${d}.cpt"; rc=$?
-    if [ $rc -ne 0 ] && [ -f "${d}_prev.cpt" ]; then mdrun_resume_noappend "$d" "${d}_prev.cpt"; rc=$?; fi
-  else
-    mdrun_resume_append "$d" "${d}.cpt"; rc=$?
-    if [ $rc -ne 0 ]; then echo "→ -append failed; -noappend"; mdrun_resume_noappend "$d" "${d}.cpt"; rc=$?; fi
-    if [ $rc -ne 0 ] && [ -f "${d}_prev.cpt" ]; then mdrun_resume_noappend "$d" "${d}_prev.cpt"; rc=$?; fi
+  # ALWAYS -noappend: each resume writes a fresh ${d}.partNNNN.* so existing .xtc
+  # are strictly append-only. That makes the supervisor's rsync --append safe and
+  # avoids the GROMACS -append rewind that would corrupt an already-pulled .xtc.
+  mdrun_resume_noappend "$d" "${d}.cpt"; rc=$?
+  if [ $rc -ne 0 ] && [ -f "${d}_prev.cpt" ]; then
+    echo "→ ${d}: retry from ${d}_prev.cpt (-noappend)"; mdrun_resume_noappend "$d" "${d}_prev.cpt"; rc=$?
   fi
   set -e
   return $rc
@@ -207,7 +231,7 @@ clear_mark FAILED
 mark STARTED
 
 if [ -n "$EXTEND_BASE" ]; then
-  echo "MODE: EXTEND base=$EXTEND_BASE target=${EXTEND_TO_PS}ps"; run_extend; exit 0
+  echo "MODE: EXTEND base=$EXTEND_BASE target=${EXTEND_TO_PS}ps"; run_extend; wait_for_pull; exit 0
 fi
 
 # resolve the starting structure if not given
@@ -251,3 +275,4 @@ for i in $(seq 1 "$N_STAGES"); do
 done
 mark ALL_DONE
 echo "[$(date '+%F %T')] PRODUCTION COMPLETE: $REPLICA_TAG (${N_STAGES}x${STAGE_NS}ns)"
+wait_for_pull
