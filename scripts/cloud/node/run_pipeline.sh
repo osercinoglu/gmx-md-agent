@@ -27,6 +27,12 @@ set -euo pipefail
 export LC_ALL=C LANG=C
 [ -f "$HOME/gmx_activate.sh" ] && source "$HOME/gmx_activate.sh"
 
+# Some Vast/base-image environments export OMP_NUM_THREADS=1. GROMACS then FATAL-errors
+# whenever our -ntomp differs ("OMP_NUM_THREADS (1) and ... command line (N) have
+# different values"), so mdrun never starts. Clear it (and OMP_THREAD_LIMIT) so -ntomp
+# alone controls thread count.
+unset OMP_NUM_THREADS OMP_THREAD_LIMIT 2>/dev/null || true
+
 # Robust usable-core count: `nproc` honors cgroup quota/affinity and can return 1
 # inside a Vast container even on a 32-core host (that is the -ntomp 1 GPU-starvation
 # bug). Take the largest plausible signal, then clamp to any cgroup CPU quota.
