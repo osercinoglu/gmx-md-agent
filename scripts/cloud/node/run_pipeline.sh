@@ -233,12 +233,16 @@ autotune_mdrun() {
     # halfway step — always valid, unlike -resetstep <n> which FATALs if the bench tpr's
     # start step is already past <n>. Do NOT force -nstlist (keep the tpr's Verlet value);
     # overriding both was making every trial exit rc=1 (validated in a live smoke test).
+    # -notunepme: PME-on-GPU auto-enables PME load-balancing, which GROMACS refuses to
+    # combine with -resethway/-resetstep (fatal). Disable it for the bench — we want
+    # steady-state throughput on a fixed grid, comparable across trials, not a tuned
+    # grid. (Production keeps PME tuning; the bench only RANKS configs.)
     timeout "$BENCH_BUDGET_S" "$GMX" mdrun -s "$btpr" -deffnm "$d" -ntmpi 1 -ntomp "$ntomp" -pin on "${GPU_ARGS[@]}" $offload \
-      -nsteps "$BENCH_STEPS" -resethway -noconfout >"$d.out" 2>&1
+      -nsteps "$BENCH_STEPS" -resethway -notunepme -noconfout >"$d.out" 2>&1
     rc=$?; set -e
     if [ $rc -ne 0 ]; then
       echo "[autotune]   trial $i INVALID (rc=$rc) — skipped; mdrun output:"
-      grep -iE 'error|fatal|invalid|cannot|not (found|supported|compatible)|gpu|cuda|assert|abort' "$d.out" 2>/dev/null | tail -6 | sed 's/^/[autotune]       | /'
+      awk '/Fatal error:/{f=1} f{print} /manual.gromacs.org/{f=0}' "$d.out" 2>/dev/null | head -8 | sed 's/^/[autotune]       | /'
       rm -f "$d".* 2>/dev/null; continue
     fi
     nsday=$(perf_nsday "$d.log"); [ -z "$nsday" ] && nsday=0
