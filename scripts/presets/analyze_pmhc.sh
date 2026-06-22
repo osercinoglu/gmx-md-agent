@@ -52,7 +52,7 @@ disk_guard() {
 # chunk list (raw, solvated) — never concatenated solvated
 if [ -n "$EXT_BASE" ]; then
   [ -f "${EXT_BASE}.xtc" ] || { echo "pmhc preset: ${EXT_BASE}.xtc missing"; exit 1; }
-  CHUNKS="${EXT_BASE}.xtc $(ls -v md_ext*.xtc 2>/dev/null)"; TRJCAT_FLAGS=""
+  CHUNKS="${EXT_BASE}.xtc $(ls -v md_ext*.xtc 2>/dev/null || true)"; TRJCAT_FLAGS=""
 elif ls md_part*.part*.xtc >/dev/null 2>&1; then
   CHUNKS=$(ls md_part??.xtc md_part*.part*.xtc 2>/dev/null | sort -uV); TRJCAT_FLAGS=""
 else

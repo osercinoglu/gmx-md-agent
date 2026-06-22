@@ -25,4 +25,15 @@ if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ] && [ ! -f "$HOME/
   ( umask 077; { printf 'api_token="%s"\n' "$PUSHOVER_TOKEN"; printf 'user_key="%s"\n' "$PUSHOVER_USER"; } > "$HOME/.pushover/pushover-config" )
 fi
 
+# --- SSH dir for SkyPilot ---
+# SkyPilot writes /root/.ssh/{config,sky-key} and reaches the Vast node with its
+# OWN generated key — your personal keys are not needed. The ssh client rejects a
+# config/dir it does not own ("Bad owner or permissions on /root/.ssh/config"),
+# which happens if a host ~/.ssh (uid 1000) is bind-mounted here. Normalize it for
+# the container user so SkyPilot can manage SSH cleanly.
+mkdir -p "$HOME/.ssh"
+chown -R "$(id -u)":"$(id -g)" "$HOME/.ssh" 2>/dev/null || true
+chmod 700 "$HOME/.ssh" 2>/dev/null || true
+find "$HOME/.ssh" -type f -exec chmod 600 {} + 2>/dev/null || true
+
 exec python3 -m mdagent.cli "$@"

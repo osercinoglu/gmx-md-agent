@@ -43,6 +43,26 @@ ensure_rsync() {
 
 echo "[setup] GMX_IMAGE_KIND=$GMX_IMAGE_KIND"
 nvidia-smi -L 2>/dev/null || echo "[setup] WARNING: nvidia-smi not available yet"
+
+# --- GPU compatibility guard ---
+# The conda-forge GROMACS 2024.2 CUDA build is compiled with CUDA 11.8 and supports
+# up to compute capability sm_90 (Hopper). Blackwell GPUs (sm_100 B200 / sm_120
+# RTX 5090, i.e. compute_cap major >= 10) are NOT supported — mdrun would die at
+# runtime ("no compatible CUDA kernel"). Fail setup FAST (before the long conda
+# install) so the orchestrator's recovery moves to a compatible node instead of
+# wasting a full provision. Override the ceiling with GMX_MAX_SM_MAJOR if you swap
+# in a newer GROMACS/CUDA build that supports Blackwell.
+GMX_MAX_SM_MAJOR="${GMX_MAX_SM_MAJOR:-9}"
+cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')"
+if [ -n "$cc" ]; then
+  ccmaj="${cc%%.*}"
+  if [ "${ccmaj:-0}" -ge "$((GMX_MAX_SM_MAJOR + 1))" ] 2>/dev/null; then
+    echo "[setup] ERROR: GPU compute capability $cc exceeds this GROMACS build's max (sm_${GMX_MAX_SM_MAJOR}x)."
+    echo "[setup]        This is a Blackwell-class GPU the CUDA 11.8 build cannot drive — failing so a compatible node is chosen."
+    exit 1
+  fi
+  echo "[setup] GPU compute capability $cc — compatible (<= sm_${GMX_MAX_SM_MAJOR}x)"
+fi
 ensure_rsync
 
 # --- Path 1: gmx already present (NGC image / pre-baked) ---
@@ -69,9 +89,15 @@ fi
 MM="$HOME/bin/micromamba"
 if [ ! -x "$MM" ]; then
   mkdir -p "$HOME/bin"
-  curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest -o /tmp/mm.tar.bz2
-  tar -xj -f /tmp/mm.tar.bz2 -C "$HOME" --strip-components=1 bin/micromamba 2>/dev/null \
-    || tar -xjf /tmp/mm.tar.bz2 -C "$HOME" bin/micromamba
+  curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest -o /tmp/mm.tar.bz2 \
+    || { echo "[setup] ERROR: micromamba download failed"; exit 1; }
+  # The archive stores the binary at 'bin/micromamba'. Extract that member to
+  # $HOME/bin/micromamba (NO --strip-components, which would drop the bin/ prefix
+  # and land it at $HOME/micromamba — i.e. NOT where $MM points → 127 later).
+  tar -xjf /tmp/mm.tar.bz2 -C "$HOME" bin/micromamba
+  chmod +x "$MM" 2>/dev/null || true
+  [ -x "$MM" ] || { echo "[setup] ERROR: micromamba missing at $MM after extract"; exit 1; }
+  echo "[setup] micromamba ready: $MM"
 fi
 export MAMBA_ROOT_PREFIX="$HOME/micromamba"
 ENVDIR="$HOME/gmxenv"

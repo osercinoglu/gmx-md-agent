@@ -23,12 +23,15 @@ case "${MDAGENT_GPUS:-auto}" in
 esac
 
 # Mount the working folder + any credentials/state that exist on the host.
+# NOTE: we deliberately do NOT mount the host ~/.ssh — SkyPilot generates and owns
+# its own key inside the container (/root/.ssh). A bind-mounted host ~/.ssh arrives
+# owned by your uid, and the ssh client then rejects it ("Bad owner or permissions
+# on /root/.ssh/config"), breaking provisioning.
 mounts=(-v "$WORK":/work)
 for pair in \
   "$HOME/.config/vastai:/root/.config/vastai" \
   "$HOME/.pushover:/root/.pushover" \
-  "$HOME/.sky:/root/.sky" \
-  "$HOME/.ssh:/root/.ssh"; do
+  "$HOME/.sky:/root/.sky"; do
   [ -e "${pair%%:*}" ] && mounts+=(-v "$pair")
 done
 

@@ -161,9 +161,19 @@ print("Cost = $/hr x wall-hours; wall-hours = ns / (ns/day) x 24. ROUGH — the 
 # ---- selection ----
 def write_selection(r):
     accel = normalize_accel(r["gpu"])  # Vast gpu_name -> SkyPilot catalog accel token
-    # price ceiling: 20% above the picked offer's $/hr so SkyPilot can still land
-    # a comparable live offer even if this exact one is gone.
-    ceiling = round(r["dph"] * 1.20, 3)
+    # price ceiling = a GENEROUS safety cap, not a selector. SkyPilot provisions
+    # from its own (cached) Vast catalog whose prices can sit above the cheapest
+    # live offer, so a tight cap (e.g. live x1.2) makes provisioning fail
+    # ("no resource satisfying ... max_cost"). Use ~2.5x the picked price (with a
+    # floor) so the catalog has headroom while still capping runaway prices.
+    # Override with env MAX_HOURLY=<$/hr> (or MAX_HOURLY=0 to remove the cap).
+    _mh = os.environ.get("MAX_HOURLY", "").strip()
+    if _mh == "0":
+        ceiling = ""                                   # no cap
+    elif _mh:
+        ceiling = round(float(_mh), 3)
+    else:
+        ceiling = round(max(r["dph"] * 2.5, r["dph"] + 0.40), 3)
     # Do NOT pin region: SkyPilot validates `region` by exact match against the
     # catalog's full Region strings (e.g. "Germany, DE, EU"), not the offer's
     # short geolocation, so any pin tends to fail and over-constrains FAILOVER.

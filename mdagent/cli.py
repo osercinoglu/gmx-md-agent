@@ -149,12 +149,20 @@ def cloud_launch_then_supervise(verb_args, env, folder, supervise):
     e = dict(env); e["LAUNCH_NO_SUPERVISE"] = "1"
     sh(["bash", RUNNER, *verb_args, folder], env=e)
     if supervise:
-        sh(["bash", RUNNER, "supervise", folder])
+        # MUST pass the same env: the supervisor needs SYNC_MIN/TOTAL_NS/STAGE_NS/
+        # ANALYSIS/DRY_GROUP for the right pull cadence, stage count, and teardown
+        # logic. Without it it falls back to defaults (750 ns / 15 stages) and
+        # never recognizes completion → never tears down.
+        sh(["bash", RUNNER, "supervise", folder], env=env)
 
 
 def cmd_cloud(a):
     require_prod_mdp(a)
     folder = Path(a.folder).resolve()
+    if getattr(a, "dry_run", False):
+        e = cloud_env(a); e["RENDER_ONLY"] = "1"
+        sh(["bash", RUNNER, "launch", str(folder)], env=e)   # validate spec + offer listing, no GPU rented
+        return
     cloud_launch_then_supervise(["launch"], cloud_env(a), folder, supervise=not a.no_supervise)
 
 
@@ -237,6 +245,7 @@ def add_cloud_flags(sp):
     sp.add_argument("--pick", default="1", help="offer row to auto-pick (default 1)")
     sp.add_argument("--pushover-device", default=None)
     sp.add_argument("--no-supervise", action="store_true", help="provision + start only (advanced)")
+    sp.add_argument("--dry-run", action="store_true", help="validate spec + list offers, rent NOTHING ($0)")
 
 
 def build_parser():

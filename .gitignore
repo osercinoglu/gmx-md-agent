@@ -6,3 +6,6 @@ __pycache__/
 scripts/cloud/cloud.env
 scripts/cloud/cloud_selection.env
 **/*.log
+
+# stray on-node status markers if run_pipeline is executed in-tree
+scripts/cloud/node/status/

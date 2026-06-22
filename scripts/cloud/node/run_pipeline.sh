@@ -53,7 +53,13 @@ cd "$HERE"
 RUN_LOG="$HERE/run_pipeline.log"
 exec > >(tee -a "$RUN_LOG") 2>&1
 
-N_STAGES=$(( TOTAL_NS / STAGE_NS ))
+# ns / hours may arrive as floats (e.g. "1.0"); bash integer math dies on the ".0".
+# KEEPALIVE_MAXH especially: a float would crash wait_for_pull's $(( )) and silently
+# turn the data-safety keepalive into a no-op (node could autostop before the pull).
+TOTAL_NS=$(awk -v v="$TOTAL_NS" 'BEGIN{n=int(v+0); if(n<1)n=1; printf "%d", n}')
+STAGE_NS=$(awk -v v="$STAGE_NS" 'BEGIN{n=int(v+0); if(n<1)n=1; printf "%d", n}')
+KEEPALIVE_MAXH=$(awk -v v="${KEEPALIVE_MAXH:-6}" 'BEGIN{n=int(v+0); if(n<1)n=1; printf "%d", n}')
+N_STAGES=$(( (TOTAL_NS + STAGE_NS - 1) / STAGE_NS ))   # ceiling: never undershoot the target
 STATUS_DIR="$HERE/status"; mkdir -p "$STATUS_DIR"
 # optional index: only use -n if the file actually exists
 [ -n "$INDEX" ] && [ -f "$INDEX" ] || INDEX=""

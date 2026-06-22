@@ -35,6 +35,13 @@ RUN chmod +x /usr/local/bin/entrypoint.sh \
     && find ./scripts -name '*.sh' -exec chmod +x {} + \
     && find ./scripts -name '*.py' -exec chmod +x {} +
 
+# Patch SkyPilot's Vast provisioner: it builds a search query with geolocation,
+# which makes Vast IGNORE the gpu_name filter and return all GPU types; it then
+# takes instance_list[0] — often a Blackwell card (RTX 5090 / B200) that the
+# GROMACS 2024.2 CUDA-11.8 build cannot run. The patch strictly keeps the exact
+# requested GPU (cheapest, optional VAST_MAX_DPH ceiling) so it never substitutes.
+RUN python3 ./scripts/cloud/patches/patch_sky_vast.py
+
 ENV PYTHONPATH=/opt/gmx-md-agent \
     PYTHONUNBUFFERED=1
 

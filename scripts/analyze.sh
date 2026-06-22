@@ -34,7 +34,7 @@ fi
 
 # last production tpr (full, solvated reference for the dry selection).
 # NB: $1 is a glob and must stay UNQUOTED so the shell expands it.
-last_of() { ls -v $1 2>/dev/null | tail -1; }
+last_of() { ls -v $1 2>/dev/null | tail -1 || true; }   # || true: empty glob => ls exit 2 would crash set -e
 if [ -n "$EXT_BASE" ]; then
   LAST_TPR="$(last_of 'md_ext*.tpr')"
 else

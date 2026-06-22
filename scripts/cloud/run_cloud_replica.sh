@@ -46,6 +46,11 @@ IMAGE="${IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}"
 IMAGE_KIND="${IMAGE_KIND:-conda}"
 CONDA_SPEC="${CONDA_SPEC:-gromacs=2024.2=nompi_cuda_*}"
 TOTAL_NS="${TOTAL_NS:-750}"; STAGE_NS="${STAGE_NS:-50}"
+# The CLI passes ns as floats (e.g. "1.0"); bash `$(( ))` only does integer math
+# and dies on the ".0". Normalize to ints (floor, min 1) so all staging arithmetic
+# — here AND on the node (it reads these from the rendered YAML) — is safe.
+TOTAL_NS=$(awk -v v="$TOTAL_NS" 'BEGIN{n=int(v+0); if(n<1)n=1; printf "%d", n}')
+STAGE_NS=$(awk -v v="$STAGE_NS" 'BEGIN{n=int(v+0); if(n<1)n=1; printf "%d", n}')
 CKPT_MIN="${CKPT_MIN:-15}";  SYNC_MIN="${SYNC_MIN:-15}"   # SYNC_MIN = local pull cadence
 MAXH_PER_STAGE="${MAXH_PER_STAGE:-48}"; MAX_RESTARTS="${MAX_RESTARTS:-10}"
 KEEPALIVE_MAXH="${KEEPALIVE_MAXH:-12}"         # node holds itself up this long awaiting a verified pull
@@ -234,7 +239,7 @@ progress_str() {
     [ -f "$STORE/status/NVT_DONE" ] && equil=$((equil+3))
     [ -f "$STORE/status/NPT_DONE" ] && equil=$((equil+5))
   fi
-  np=$(ls -1 "$STORE"/status/PROD_*_DONE 2>/dev/null | wc -l | tr -d ' ')
+  np=$( { find "$STORE/status" -maxdepth 1 -name 'PROD_*_DONE' 2>/dev/null || true; } | wc -l | tr -d ' ')
   pct=$(awk -v e="$equil" -v sp="$span" -v np="$np" -v N="$N" -v ad="$adone" 'BEGIN{
     p=e+(N>0?sp*np/N:0); if(ad==1)p=100; if(p>100)p=100; printf "%.0f",p }')
   filled=$(( pct/10 ))
@@ -246,9 +251,11 @@ progress_str() {
 # step from the newest GROMACS .log. Echoes "md_partNN: step X/Y (Z%)" or "".
 stage_step_str() {
   local STORE="$1" log nsteps cur
-  log=$(ls -t "$STORE"/md_part*.log 2>/dev/null | head -1)
+  # find (not ls<glob>) so no-match exits 0 — under `set -o pipefail` a literal-glob
+  # `ls` exits 2 and would crash the assignment via set -e.
+  log=$( { find "$STORE" -maxdepth 1 -name 'md_part*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-; } || true )
   [ -n "$log" ] && [ -f "$log" ] || return 0
-  nsteps=$(grep -m1 -E 'nsteps[[:space:]]*=' "$log" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+  nsteps=$(grep -m1 -E 'nsteps[[:space:]]*=' "$log" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)
   cur=$(awk 'tolower($1)=="step" && tolower($2)=="time"{getline; gsub(/^[[:space:]]+/,""); s=$1} END{if(s!="")print s}' "$log" 2>/dev/null)
   [ -n "$nsteps" ] && [ -n "$cur" ] || return 0
   awk -v c="$cur" -v n="$nsteps" -v f="$(basename "$log")" 'BEGIN{
@@ -376,9 +383,13 @@ pull_state() {
   return "$rc"
 }
 
-# SSH-list the node's trajectory files with sizes; rc!=0 => node unreachable.
+# SSH-list the node's trajectory files with sizes; rc!=0 => node UNREACHABLE only.
+# Must exit 0 (empty output) when reachable-but-no-chunks-yet (EM/NVT/NPT phase),
+# else pull_verified would read "unreachable" during equilibration and the recovery
+# path could tear down a healthy node. nullglob drops unmatched globs; ssh transport
+# failure on a truly down host still yields rc!=0.
 remote_xtc_sizes() {
-  $SSH_OPTS "$1" 'cd sky_workdir 2>/dev/null && stat -c "%s %n" md_part*.xtc md_ext*.xtc 2>/dev/null' 2>/dev/null
+  $SSH_OPTS "$1" 'cd sky_workdir 2>/dev/null || exit 0; shopt -s nullglob; f=(md_part*.xtc md_ext*.xtc); [ ${#f[@]} -gt 0 ] && stat -c "%s %n" "${f[@]}" 2>/dev/null; exit 0' 2>/dev/null
 }
 # Tell the node its data is safely local (releases its keepalive hold).
 mark_pulled_ok() { $SSH_OPTS "$1" 'mkdir -p sky_workdir/status && touch sky_workdir/status/PULLED_OK' 2>/dev/null || true; }
@@ -502,7 +513,9 @@ cmd_launch() {
   if [ -n "$START_STRUCT" ]; then
     [ -f "$REPLICA_DIR/$START_STRUCT" ] || die "starting structure '$START_STRUCT' not found in $REPLICA_DIR"
   else
-    ls "$REPLICA_DIR"/*.gro "$REPLICA_DIR"/*.pdb >/dev/null 2>&1 || die "no .gro/.pdb starting structure in $REPLICA_DIR (set START_STRUCT/--struct)"
+    # NB: `ls a b` returns nonzero if ANY glob is empty — check existence robustly.
+    _hs=0; for _s in "$REPLICA_DIR"/*.gro "$REPLICA_DIR"/*.pdb; do [ -f "$_s" ] && { _hs=1; break; }; done
+    [ "$_hs" = 1 ] || die "no .gro/.pdb starting structure in $REPLICA_DIR (set START_STRUCT/--struct)"
   fi
 
   say "Bootstrap (tools + Vast key)"
@@ -533,7 +546,7 @@ cmd_launch() {
   if [ "${RENDER_ONLY:-0}" = "1" ]; then
     say "RENDER_ONLY=1 — validating the rendered spec without renting a GPU"
     python3 -c "import sky; sky.Task.from_yaml('$STAGE/gromacs_md.sky.yaml'); print('   Task.from_yaml: OK')" || die "rendered YAML failed to parse"
-    ( cd "$STAGE" && "$SKY" launch --dryrun ./gromacs_md.sky.yaml 2>&1 | sed -n '1,40p' ) || true
+    ( cd "$STAGE" && "$SKY" launch --dryrun --yes ./gromacs_md.sky.yaml 2>&1 | sed -n '1,40p' ) || true
     return 0
   fi
 
@@ -543,14 +556,30 @@ cmd_launch() {
   # backstop; data safety does NOT depend on it — the node holds itself up
   # (KEEPALIVE_MAXH) until the supervisor confirms a verified pull, and teardown
   # only happens after that verified pull.
-  ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run -i 30 --down ) \
-    || die "sky launch failed — check the output above."
+  if ! ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run -i 30 --down ); then
+    # A failed launch can still leave a billed Vast instance (e.g. SSH-setup
+    # timeout AFTER allocation). Destroy it and clear the cluster record so we
+    # never leak a paid node on a failed provision.
+    echo ">> sky launch failed — tearing down any partially-provisioned node for $JOB"
+    destroy_this_job_instance "$JOB" || true
+    "$SKY" down -y "$JOB" >/dev/null 2>&1 || true
+    die "sky launch failed — check the output above (leaked instance, if any, destroyed)."
+  fi
+
+  # The node is now BILLING. Until we hand off cleanly (to the caller in
+  # LAUNCH_NO_SUPERVISE mode, or to the spawned supervisor below), an EXIT trap
+  # tears it down on ANY failure/exit of this launch process — so a post-launch
+  # crash (e.g. a bookkeeping bug) can never leak a paid node. Disarmed on clean
+  # handoff. _LAUNCH_HANDOFF_OK is global so it is visible when the trap fires.
+  _LAUNCH_HANDOFF_OK=0
+  trap "[ \"\${_LAUNCH_HANDOFF_OK:-0}\" = 1 ] || { echo '>> launch exited before supervisor handoff — tearing down $JOB to avoid a leak'; destroy_this_job_instance '$JOB' 2>/dev/null || true; '$SKY' down -y '$JOB' >/dev/null 2>&1 || true; }" EXIT
 
   local VAST_ID=""; refresh_vast_id "$JOB"
   notify "Run starting on $JOB: ${TOTAL_NS} ns in $(( TOTAL_NS / STAGE_NS )) stages" "$TAG ▶" 0
 
   if [ "${LAUNCH_NO_SUPERVISE:-0}" = "1" ]; then
     say "LAUNCH_NO_SUPERVISE=1 — node is running; supervisor NOT spawned (caller drives it)."
+    _LAUNCH_HANDOFF_OK=1; trap - EXIT   # caller (CLI) owns teardown from here
     return 0
   fi
 
@@ -558,6 +587,7 @@ cmd_launch() {
   say "Spawning background supervisor (pull + recover + analyze + teardown)"
   nohup bash "$0" supervise "$REPLICA_DIR" >"$SUPLOG" 2>&1 &
   echo $! > "$SUPPID"
+  _LAUNCH_HANDOFF_OK=1; trap - EXIT   # supervisor now owns the node's lifecycle
   echo "============================================================"
   echo " Launched: $JOB   (supervisor PID $(cat "$SUPPID"))"
   echo "   follow   : $0 follow $REPLICA_DIR     (tails $SUPLOG)"
@@ -610,7 +640,7 @@ cmd_extend() {
   ensure_local_gmx     # needed to read the current end time of the .tpr
 
   local cur_ps cur_ns target_ns added_ns n_ext
-  cur_ps="$(local_tpr_end_ps "$btpr")"
+  cur_ps="$(local_tpr_end_ps "$btpr" || true)"   # tolerate gmx-dump failure so the -n guard below fires
   [ -n "$cur_ps" ] || die "could not read end time from $btpr (gmx dump failed)"
   cur_ns=$(awk -v p="$cur_ps" 'BEGIN{printf "%g", p/1000}')
   if [ -n "${EXTEND_TO_NS:-}" ]; then
@@ -647,25 +677,37 @@ cmd_extend() {
   if [ "${RENDER_ONLY:-0}" = "1" ]; then
     say "RENDER_ONLY=1 — validating the rendered spec without renting a GPU"
     python3 -c "import sky; sky.Task.from_yaml('$STAGE/gromacs_md.sky.yaml'); print('   Task.from_yaml: OK')" || die "rendered YAML failed to parse"
-    ( cd "$STAGE" && "$SKY" launch --dryrun ./gromacs_md.sky.yaml 2>&1 | sed -n '1,40p' ) || true
+    ( cd "$STAGE" && "$SKY" launch --dryrun --yes ./gromacs_md.sky.yaml 2>&1 | sed -n '1,40p' ) || true
     return 0
   fi
 
   assert_cluster_free "$JOB"
   say "Provisioning Vast.ai node + installing GROMACS…"
-  ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run -i 30 --down ) \
-    || die "sky launch failed — check the output above."
+  if ! ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run -i 30 --down ); then
+    # A failed launch can still leave a billed Vast instance (e.g. SSH-setup
+    # timeout AFTER allocation). Destroy it and clear the cluster record so we
+    # never leak a paid node on a failed provision.
+    echo ">> sky launch failed — tearing down any partially-provisioned node for $JOB"
+    destroy_this_job_instance "$JOB" || true
+    "$SKY" down -y "$JOB" >/dev/null 2>&1 || true
+    die "sky launch failed — check the output above (leaked instance, if any, destroyed)."
+  fi
+  # Node is BILLING now; tear it down on any pre-handoff exit (see cmd_launch).
+  _LAUNCH_HANDOFF_OK=0
+  trap "[ \"\${_LAUNCH_HANDOFF_OK:-0}\" = 1 ] || { echo '>> launch exited before supervisor handoff — tearing down $JOB to avoid a leak'; destroy_this_job_instance '$JOB' 2>/dev/null || true; '$SKY' down -y '$JOB' >/dev/null 2>&1 || true; }" EXIT
   local VAST_ID=""; refresh_vast_id "$JOB"
   notify "Extending $EXT_BASE on $JOB: ${cur_ns} -> ${target_ns} ns (+${added_ns}, $n_ext chunks)" "$TAG ▶" 0
 
   if [ "${LAUNCH_NO_SUPERVISE:-0}" = "1" ]; then
     say "LAUNCH_NO_SUPERVISE=1 — node is running; supervisor NOT spawned (caller drives it)."
+    _LAUNCH_HANDOFF_OK=1; trap - EXIT   # caller (CLI) owns teardown from here
     return 0
   fi
   local SUPLOG SUPPID; SUPLOG="$(suplog_of "$REPLICA_DIR")"; SUPPID="$(suppid_of "$REPLICA_DIR")"
   say "Spawning background supervisor (pull + recover + analyze + teardown)"
   nohup bash "$0" supervise "$REPLICA_DIR" >"$SUPLOG" 2>&1 &
   echo $! > "$SUPPID"
+  _LAUNCH_HANDOFF_OK=1; trap - EXIT   # supervisor now owns the node's lifecycle
   echo "============================================================"
   echo " Extending: $JOB  (supervisor PID $(cat "$SUPPID"))   ${cur_ns} -> ${target_ns} ns"
   echo "   follow   : $0 follow $REPLICA_DIR"
@@ -684,7 +726,7 @@ cmd_supervise() {
   local TAG JOB STAGE STORE; TAG="$(tag_of "$REPLICA_DIR")"; JOB="$(jobname_of "$REPLICA_DIR")"
   STAGE="$(stage_dir "$REPLICA_DIR")"; STORE="$(store_dir "$REPLICA_DIR")"
   [ -f "$STAGE/gromacs_md.sky.yaml" ] || die "no rendered spec at $STAGE — run 'launch' first."
-  mkdir -p "$STORE"
+  mkdir -p "$STORE" "$STORE/status"   # status/ may not be pulled yet; keep find/globs from erroring on a missing dir
   echo "[$(date '+%F %T')] supervising $JOB  (pull cadence ${SYNC_MIN}m, max restarts ${MAX_RESTARTS})"
 
   local N_STAGES=$(( TOTAL_NS / STAGE_NS )) MODE="normal" NS_BASE=0 STAGE_WORD="production"
@@ -700,7 +742,7 @@ cmd_supervise() {
     if [ -z "$VAST_ID" ] || [ "$VAST_ID" = "vast#?" ]; then refresh_vast_id "$JOB"; fi
     if pull_state "$JOB" "$STORE"; then
       fails=0
-      nprod=$(ls -1 "$STORE"/status/PROD_*_DONE 2>/dev/null | wc -l | tr -d ' ')
+      nprod=$( { find "$STORE/status" -maxdepth 1 -name 'PROD_*_DONE' 2>/dev/null || true; } | wc -l | tr -d ' ')
       if [ "$first_pull" = 1 ]; then
         # Baseline: record what is already done WITHOUT notifying, so a (re)attach
         # of the supervisor doesn't replay milestones reached on a previous run.
@@ -760,6 +802,19 @@ cmd_supervise() {
       pull_verified "$JOB" "$STORE" || echo "[$(date '+%F %T')] WARN: failure-time pull not fully verified"
       notify "$TAG ❌ node FAILED at: $where — data pulled to .cloud_state; node left up (~${KEEPALIVE_MAXH}h) for inspection" "$TAG ❌" 1
       echo "[$(date '+%F %T')] node FAILED at: $where — data pulled; node left up, auto-stops after keepalive."
+      return 1
+    fi
+
+    # SkyPilot-level failure with NO node marker (e.g. the on-node setup step failed
+    # before run_pipeline could write status/FAILED). The node is provisioned and
+    # billing but will never produce data, and a setup failure is usually
+    # deterministic, so retrying is futile — tear down to stop billing.
+    if "$SKY" queue "$JOB" 2>/dev/null | grep -qE '(FAILED_SETUP|FAILED|CANCELLED)'; then
+      say "SkyPilot job for $JOB is in a FAILED state (likely on-node setup) — no recoverable data."
+      pull_verified "$JOB" "$STORE" >/dev/null 2>&1 || true   # best-effort grab of any logs
+      notify "$TAG ❌ node setup/job FAILED (SkyPilot) — see '$SKY logs $JOB 1'; tearing down to stop billing" "$TAG ❌" 1
+      echo "[$(date '+%F %T')] SkyPilot FAILED_SETUP/FAILED for $JOB — tearing down."
+      teardown_cluster "$REPLICA_DIR"
       return 1
     fi
 
