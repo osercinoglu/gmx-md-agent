@@ -485,14 +485,54 @@ instance_present() {
   esac
 }
 
-# Destroy ONLY this job's Vast instance (scoped — never touches other replicas).
+# Echo ALL Vast instance ids whose label belongs to cluster $1 (newest/highest id
+# first). SkyPilot provision-failover can leave MORE THAN ONE instance under the same
+# "<job>-...-head" label, so teardown/reap must handle the whole set, not just one.
+vast_ids_for() {
+  local raw rc
+  set +e; raw="$("$VASTAI" show instances --raw 2>/dev/null)"; rc=$?; set -e
+  { [ "$rc" -ne 0 ] || [ -z "$raw" ]; } && return 0
+  printf '%s' "$raw" | python3 -c '
+import sys, json
+job = sys.argv[1]
+try: data = json.load(sys.stdin)
+except Exception: sys.exit(0)
+ids = [int(o["id"]) for o in (data or [])
+       if str(o.get("label") or "").startswith(job + "-")
+       and str(o.get("label") or "").endswith("-head") and o.get("id") is not None]
+for i in sorted(ids, reverse=True): print(i)
+' "$1" 2>/dev/null || true
+}
+
+# Destroy ALL of this job's Vast instances (scoped to this job's label; never other
+# replicas). Destroys every match — not just the first — so a failover-leaked
+# duplicate cannot survive a teardown.
 destroy_this_job_instance() {
-  local id; id="$(vast_desc "$1")"; id="${id#vast#}"; id="${id%%/*}"
-  if [ -n "$id" ] && [ "$id" != "?" ]; then
-    echo ">> destroying this job's Vast instance $id"; "$VASTAI" destroy instance "$id" -y || true
-  else
-    echo ">> no live Vast instance for $1 (already gone)"
-  fi
+  local ids id n=0
+  ids="$(vast_ids_for "$1")"
+  if [ -z "$ids" ]; then echo ">> no live Vast instance for $1 (already gone)"; return 0; fi
+  while read -r id; do
+    [ -n "$id" ] || continue
+    echo ">> destroying this job's Vast instance $id"; "$VASTAI" destroy instance "$id" -y || true; n=$((n+1))
+  done <<< "$ids"
+  echo ">> destroyed $n instance(s) for $1"
+}
+
+# Reconcile a provision-failover LEAK: if >1 instance carries this job's label, keep
+# the newest (the cluster's current node) and destroy the older leaked duplicate(s).
+reap_duplicate_instances() {
+  local ids cnt id first=1 n=0
+  ids="$(vast_ids_for "$1")"
+  [ -z "$ids" ] && return 0
+  cnt="$(printf '%s\n' "$ids" | grep -c . || true)"
+  [ "${cnt:-0}" -le 1 ] && return 0
+  echo "[$(date '+%F %T')] WARN: $cnt instances share label $1 (SkyPilot failover leak) — keeping newest, destroying $((cnt-1)) extra(s)"
+  while read -r id; do
+    [ -n "$id" ] || continue
+    if [ "$first" = 1 ]; then first=0; echo "  keep (newest): $id"; continue; fi
+    echo "  destroy leaked duplicate: $id"; "$VASTAI" destroy instance "$id" -y || true; n=$((n+1))
+  done <<< "$ids"
+  [ "$n" -gt 0 ] && notify "$TAG ⛔ reaped $n leaked duplicate node(s) for $1 (SkyPilot failover)" "$TAG ⛔" 1 || true
 }
 
 # Refuse to launch over a cluster of the same name that is already UP (double
@@ -824,6 +864,7 @@ cmd_supervise() {
   while true; do
     # resolve (or re-resolve after a recovery) the Vast instance id for messages
     if [ -z "$VAST_ID" ] || [ "$VAST_ID" = "vast#?" ]; then refresh_vast_id "$JOB"; fi
+    reap_duplicate_instances "$JOB"   # clean up any SkyPilot failover-leaked duplicate node
     if pull_state "$JOB" "$STORE"; then
       fails=0
       nprod=$( { find "$STORE/status" -maxdepth 1 -name 'PROD_*_DONE' 2>/dev/null || true; } | wc -l | tr -d ' ')
