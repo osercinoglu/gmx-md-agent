@@ -246,7 +246,8 @@ notify() {
   local msg="$1" title="${2:-replica}" priority="${3:-0}"
   local ctx="[${TAG:-replica} · ${VAST_ID:-vast pending}]"
   read_pushover
-  if [ -x "$PUSHOVER_SH" ] && [ -n "$PUSHOVER_TOKEN" ] && [ -n "$PUSHOVER_USER" ]; then
+  # -f not -x: we run it via `bash`, so the exec bit (often dropped by git) is irrelevant
+  if [ -f "$PUSHOVER_SH" ] && [ -n "$PUSHOVER_TOKEN" ] && [ -n "$PUSHOVER_USER" ]; then
     bash "$PUSHOVER_SH" -t "$PUSHOVER_TOKEN" -u "$PUSHOVER_USER" \
       -T "$title" -p "$priority" ${PUSHOVER_DEVICE:+-d "$PUSHOVER_DEVICE"} \
       "$msg  $ctx" >/dev/null 2>&1 || true
@@ -594,7 +595,7 @@ cmd_supervise() {
     MODE="extend"; N_STAGES="${EXTEND_STAGES:-$N_STAGES}"; NS_BASE="${EXTEND_CURRENT_NS:-0}"; STAGE_WORD="extension"
     echo "[$(date '+%F %T')] mode=EXTEND base=${EXTEND_BASE:-?} from ${NS_BASE} ns in ${N_STAGES} x ${STAGE_NS} ns chunks"
   fi
-  local restarts=0 fails=0 last_prod=0 nvt_done=0 npt_done=0 first_pull=1 nprod VAST_ID=""
+  local restarts=0 fails=0 last_prod=0 em_done=0 nvt_done=0 npt_done=0 first_pull=1 nprod VAST_ID=""
   while true; do
     # resolve (or re-resolve after a recovery) the Vast instance id for messages
     if [ -z "$VAST_ID" ] || [ "$VAST_ID" = "vast#?" ]; then refresh_vast_id "$JOB"; fi
@@ -605,11 +606,15 @@ cmd_supervise() {
         # Baseline: record what is already done WITHOUT notifying, so a (re)attach
         # of the supervisor doesn't replay milestones reached on a previous run.
         last_prod="$nprod"
+        [ -f "$STORE/status/EM_DONE" ]  && em_done=1
         [ -f "$STORE/status/NVT_DONE" ] && nvt_done=1
         [ -f "$STORE/status/NPT_DONE" ] && npt_done=1
         first_pull=0
       else
-        # equilibration milestones (fresh runs only; extend has no NVT/NPT markers)
+        # equilibration milestones (fresh runs only; extend has no EM/NVT/NPT markers)
+        if [ "$em_done" = 0 ] && [ -f "$STORE/status/EM_DONE" ]; then
+          notify "$TAG: energy minimization done — $(progress_str "$STORE" "$N_STAGES" 0 "$MODE")" "$TAG ⚡" 0; em_done=1
+        fi
         if [ "$nvt_done" = 0 ] && [ -f "$STORE/status/NVT_DONE" ]; then
           notify "$TAG: NVT equilibration done (1 ns) — $(progress_str "$STORE" "$N_STAGES" 0 "$MODE")" "$TAG 🌡" 0; nvt_done=1
         fi

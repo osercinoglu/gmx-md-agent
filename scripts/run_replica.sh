@@ -81,13 +81,16 @@ PUSHOVER_USER="${PUSHOVER_USER:-${user_key:-}}"
 # ------------------------- Pushover -------------------------
 notify() {
   local msg="$1" title="${2:-$REPLICA_TAG}" priority="${3:-0}"
-  if [ -x "$PUSHOVER_SH" ] && [ -n "$PUSHOVER_TOKEN" ] && [ -n "$PUSHOVER_USER" ]; then
+  # Use -f (not -x): notify runs `bash "$PUSHOVER_SH"`, so the exec bit is
+  # irrelevant — and git clones often drop it, which previously silenced alerts.
+  if [ -f "$PUSHOVER_SH" ] && [ -n "$PUSHOVER_TOKEN" ] && [ -n "$PUSHOVER_USER" ]; then
     bash "$PUSHOVER_SH" \
       -t "$PUSHOVER_TOKEN" -u "$PUSHOVER_USER" \
       -T "$title" -p "$priority" \
       ${PUSHOVER_DEVICE:+-d "$PUSHOVER_DEVICE"} \
       "$msg" >/dev/null 2>&1 || true
   fi
+  return 0
 }
 
 # ------------------------- Progress -------------------------
@@ -118,13 +121,10 @@ advance() {
   local delta=$1
   PROGRESS=$(awk "BEGIN{printf \"%.2f\", $PROGRESS + $delta}")
   bar "$PROGRESS"
-  local pct_int=${PROGRESS%.*}
-  local milestone=$(( (pct_int / 10) * 10 ))
-  if [ "$milestone" -gt "$LAST_NOTIFIED" ] && [ "$milestone" -ge 10 ]; then
-    notify "$REPLICA_TAG: ${milestone}% — last completed: ${STAGE_NAME}" \
-           "$REPLICA_TAG ${milestone}%" 0
-    LAST_NOTIFIED=$milestone
-  fi
+  # One Pushover per completed stage — advance() is called exactly once after
+  # each stage (EM, NVT, NPT, every production part, analysis), so you get a
+  # ping at each, not just at 10% boundaries.
+  notify "${STAGE_NAME} done — ${PROGRESS%.*}% complete" "$REPLICA_TAG ${PROGRESS%.*}%" 0
 }
 
 stage_banner() {
