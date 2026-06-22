@@ -14,6 +14,14 @@ set -euo pipefail
 IMAGE="${MDAGENT_IMAGE:-gmx-md-agent}"
 WORK="${MDAGENT_WORK:-$PWD}"
 
+# Stable, host-unique run id. Inside the container the working dir is ALWAYS /work,
+# so deriving the SkyPilot cluster name from the in-container path makes every
+# replica collide on one name (teardown/recovery/status then hit the wrong run).
+# Derive it from the HOST folder here and forward it so each folder maps to its own
+# cluster, consistently across launch/status/teardown.
+MDAGENT_RUN_ID="${MDAGENT_RUN_ID:-$(basename "$WORK")-$(printf '%s' "$WORK" | cksum | cut -d' ' -f1)}"
+export MDAGENT_RUN_ID
+
 # GPU passthrough: explicit env wins; else auto-detect. Only the `local` subcommand
 # uses THIS machine's GPU — cloud/extend(--where cloud)/status/follow/teardown just
 # orchestrate (GROMACS runs on the rented node), so requesting --gpus there is
@@ -49,11 +57,14 @@ done
 # KEEPALIVE_MAXH: hours a node holds itself up awaiting a verified pull;
 # GMX_MAX_SM_MAJOR: max GPU compute-capability major the node GROMACS supports (9 for 2024.2).
 env_args=()
-for v in VAST_MAX_DPH MAX_HOURLY KEEPALIVE_MAXH GMX_MAX_SM_MAJOR GMX_CONDA_SPEC VAST_API_KEY PUSHOVER_TOKEN PUSHOVER_USER; do
+for v in MDAGENT_RUN_ID VAST_MAX_DPH VAST_BLOCK_MACHINES MAX_HOURLY AUTOSTOP_MIN KEEPALIVE_MAXH GMX_MAX_SM_MAJOR GMX_CONDA_SPEC FORCE NUKE_ALL VAST_API_KEY PUSHOVER_TOKEN PUSHOVER_USER; do
   [ -n "${!v:-}" ] && env_args+=(-e "$v=${!v}")
 done
 
-mode=(--rm -it)
-[ "${MDAGENT_DETACH:-0}" = "1" ] && mode=(--rm -d)
+# --rm always; -d to detach (long runs); -it only when on a real terminal — forcing
+# -it breaks non-interactive use (pipes, cron, CI: "cannot attach stdin to a TTY").
+mode=(--rm)
+if [ "${MDAGENT_DETACH:-0}" = "1" ]; then mode+=(-d)
+elif [ -t 0 ] && [ -t 1 ]; then mode+=(-it); fi
 
 exec docker run "${mode[@]}" "${gpu_args[@]}" "${env_args[@]}" "${mounts[@]}" "$IMAGE" "$@"

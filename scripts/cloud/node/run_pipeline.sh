@@ -150,7 +150,18 @@ tpr_end_ps() {            # end time (ps) baked into a tpr = nsteps*dt
     END{ if(ns!=""&&dt!="") printf "%.6f", ns*dt }'
 }
 
-stage_done() { local d="$1"; [ -f "${d}.gro" ] || ls "${d}".part*.gro >/dev/null 2>&1; }
+stage_done() {
+  local d="$1"
+  # Final structure must exist...
+  [ -f "${d}.gro" ] || ls "${d}".part*.gro >/dev/null 2>&1 || return 1
+  # ...and for production/extension chunks the TRAJECTORY must exist too. A recovery
+  # that restaged a chunk's .gro without its .xtc would otherwise be treated as a
+  # finished chunk and skipped, leaving a hole that later passes ALL_DONE verification.
+  case "$d" in
+    md_part*|md_ext*) [ -f "${d}.xtc" ] || ls "${d}".part*.xtc >/dev/null 2>&1 || return 1 ;;
+  esac
+  return 0
+}
 latest_gro() {
   local d="$1"
   if ls "${d}".part*.gro >/dev/null 2>&1; then ls -v "${d}".part*.gro | tail -1; else echo "${d}.gro"; fi
