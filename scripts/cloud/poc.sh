@@ -14,6 +14,9 @@
 #            and verify the supervisor re-provisions and GROMACS RESUMES from the
 #            checkpoint (a md_partNN.partNNNN.xtc continuation appears / node log
 #            says "continuing from step"), NOT from step 0. Then tear down.
+#   expire   Like resume, but STOPS the instance (rental-expiry) instead of
+#            destroying it, so it lingers as an exited record — the case that used
+#            to wedge recovery. Verifies status-aware relaunch from the checkpoint.
 #   all      happy then resume (default).
 #
 # Env: GPU_NAMES (default "RTX_4090,RTX_3090"), TYPE (default on-demand),
@@ -171,6 +174,41 @@ poc_resume() {
   teardown
 }
 
+# ---------------- expire (rental-expiry resume test) ----------------
+# Unlike `resume`, which DESTROYS the instance (it then vanishes from the Vast
+# listing — the easy case), this STOPS the instance so it lingers as an
+# exited/stopped record. That reproduces a real reserved-time EXPIRY, which used to
+# wedge the supervisor in "present but unreachable — NOT destroying" forever. Proves
+# the status-aware recovery (instance_present treats a stopped rental as dead).
+poc_expire() {
+  prepare_poc_dir
+  pick_offer
+  say "Launching POC (auto-supervised) for the EXPIRY (stop, not destroy) resume test"
+  poc_env bash "$RUNNER" launch "$POC_DIR"
+
+  say "Waiting (≤${POC_TIMEOUT}s) for a mid-run checkpoint to be PULLED locally ($STORE/md_part01.cpt)…"
+  if wait_for "$STORE" "md_part01.cpt" "$POC_TIMEOUT"; then echo; ok "checkpoint md_part01.cpt pulled locally"; else echo; bad "no checkpoint pulled in time"; teardown; return; fi
+
+  say "Simulating rental EXPIRY: STOPPING (not destroying) the live Vast instance so it lingers as 'exited'"
+  local ids id stopped=0
+  ids="$($VASTAI show instances --raw 2>/dev/null | python3 -c 'import sys,json;print(" ".join(str(o["id"]) for o in json.load(sys.stdin)))' 2>/dev/null)"
+  for id in $ids; do echo "  stopping instance $id"; $VASTAI stop instance "$id" 2>/dev/null && stopped=1 || true; done
+  [ "$stopped" = 1 ] && ok "instance stopped (rental-expiry simulated; still listed as exited)" || bad "could not stop a live Vast instance"
+
+  say "Verifying the supervisor classifies the stopped rental as DEAD and RESUMES on a fresh node"
+  echo "  (expect a 'node confirmed EXPIRED/stopped' log line, then a re-provision + checkpoint resume)"
+  local resumed=0
+  if wait_for "$STORE" "md_part01.part*.xtc" "$POC_TIMEOUT"; then resumed=1; fi
+  if [ "$resumed" != 1 ] && grep -qiE 'EXPIRED/stopped|continuing from step|Reading checkpoint' "$STORE/run_pipeline.log" "$POC_DIR/.cloud_supervise.log" 2>/dev/null; then resumed=1; fi
+  [ "$resumed" = 1 ] && ok "supervisor recovered from an EXPIRED (stopped) rental and resumed" \
+                      || bad "did NOT recover from a stopped rental — inspect $(basename "$POC_DIR")/.cloud_supervise.log"
+
+  say "Waiting for the recovered run to finish + analyze (prod_dry.xtc)…"
+  if wait_for "$POC_DIR" "prod_dry.xtc" "$POC_TIMEOUT"; then echo; ok "recovered run completed + analyzed"; else echo; bad "recovered run did not complete in time"; fi
+  verify_results
+  teardown
+}
+
 # ---------------- extend (continue an existing run) ----------------
 poc_extend() {
   local base="md_part01"
@@ -197,9 +235,10 @@ case "$MODE" in
   dryrun) poc_dryrun ;;
   happy)  poc_happy ;;
   resume) poc_resume ;;
+  expire) poc_expire ;;
   extend) poc_extend ;;
   all)    poc_happy; poc_resume ;;
-  *) echo "usage: $0 {dryrun|happy|resume|extend|all}"; exit 1 ;;
+  *) echo "usage: $0 {dryrun|happy|resume|expire|extend|all}"; exit 1 ;;
 esac
 
 say "POC SUMMARY"

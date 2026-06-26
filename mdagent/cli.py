@@ -88,6 +88,9 @@ def local_run_env(a):
         "TOTAL_NS": a.total_ns, "STAGE_NS": a.stage_ns, "CKPT_MIN": a.ckpt_min,
         "MAXH_PER_STAGE": a.maxh, "NT": getattr(a, "nt", None),
         "GPU_ID": getattr(a, "gpu_id", 0), "GMX": "gmx",
+        # Local runs have no cloud supervisor to confirm a pull; tell run_pipeline.sh
+        # not to block on status/PULLED_OK at the end (else it hangs for KEEPALIVE_MAXH).
+        "WAIT_FOR_PULL": 0,
     }
     e.update(input_env(a))
     return e
@@ -121,6 +124,58 @@ def cloud_env(a):
     return e
 
 
+# ----------------------- local resume helpers -----------------------------
+def local_run_summary(folder: Path):
+    """One-line summary of prior on-disk progress in a local run folder, or None.
+
+    Resume is driven entirely by folder state: run_pipeline.sh skips any phase/chunk
+    whose outputs exist and resumes a partial chunk from its .cpt. This just reports
+    what's already there so the CLI can announce a RESUME instead of a fresh run.
+    """
+    st = folder / "status"
+    cpts = sorted(folder.glob("md_part*.cpt")) + sorted(folder.glob("md_ext*.cpt"))
+    if not st.is_dir() and not cpts:
+        return None
+    parts = []
+    if st.is_dir():
+        if (st / "ALL_DONE").exists():
+            parts.append("ALL_DONE (already complete)")
+        for marker, label in (("EM_DONE", "EM"), ("NVT_DONE", "NVT"), ("NPT_DONE", "NPT")):
+            if (st / marker).exists():
+                parts.append(label)
+        ndone = len(list(st.glob("PROD_*_DONE")))
+        if ndone:
+            parts.append(f"{ndone} production chunk(s) done")
+        if (st / "TUNED").exists():
+            parts.append("autotuned")
+        if (st / "STARTED").exists() and not parts:
+            parts.append("started (equilibration)")
+    if cpts:
+        parts.append("checkpoint: " + ", ".join(p.stem for p in cpts[-2:]))
+    return ", ".join(parts) if parts else None
+
+
+def wipe_local_run(folder: Path):
+    """Delete pipeline OUTPUTS for a clean restart, preserving inputs (topology,
+    structures, mdp/). Returns the number of paths removed."""
+    import glob as _glob
+    targets = ["status", "bench", "run_pipeline.log",
+               "em.*", "nvt.*", "npt.*", "md_part*", "md_ext*"]
+    n = 0
+    for pat in targets:
+        for p in _glob.glob(str(folder / pat)):
+            pp = Path(p)
+            try:
+                if pp.is_dir():
+                    shutil.rmtree(pp)
+                else:
+                    pp.unlink()
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
 def require_prod_mdp(a):
     if not a.prod_mdp:
         sys.exit("a fresh run needs --prod-mdp <production.mdp>")
@@ -134,7 +189,17 @@ def cmd_local(a):
     if not folder.is_dir():
         sys.exit(f"folder not found: {folder}")
     require_prod_mdp(a)
-    print(f">> LOCAL run in {folder}  ({a.total_ns} ns / {a.stage_ns} ns chunks)")
+    if getattr(a, "fresh", False):
+        removed = wipe_local_run(folder)
+        print(f">> --fresh: cleared {removed} prior run artifact(s) in {folder} — starting clean")
+    prior = None if getattr(a, "fresh", False) else local_run_summary(folder)
+    if prior:
+        print(f">> RESUMING local run in {folder}\n"
+              f"   found prior progress: {prior}\n"
+              f"   completed phases/chunks are skipped; a partial chunk resumes from its checkpoint."
+              f"  (use --fresh to restart from scratch)")
+    else:
+        print(f">> LOCAL run in {folder}  ({a.total_ns} ns / {a.stage_ns} ns chunks)")
     stage_local_pipeline(folder, a)
     sh(["bash", folder / "run_pipeline.sh"], env=local_run_env(a), cwd=folder)
     if not a.skip_analysis:
@@ -156,9 +221,32 @@ def cloud_launch_then_supervise(verb_args, env, folder, supervise):
         sh(["bash", RUNNER, "supervise", folder], env=env)
 
 
+def cloud_resume_env(a, folder):
+    """Env for `mda cloud --resume`. A resume REUSES the original launch's staged mdps +
+    recorded params, so it needs no --prod-mdp/--analysis. If the run recorded its params
+    (.cloud_run/run_params.env — any launch from this version on), pass only credentials and
+    let the node restore them. For an OLDER run with no record, fall back to the full param
+    set from the user's flags so the supervisor still gets the right run shape."""
+    creds = {
+        "VAST_API_KEY": os.environ.get("VAST_API_KEY"),
+        "PUSHOVER_DEVICE": getattr(a, "pushover_device", None),
+    }
+    if (folder / ".cloud_run" / "run_params.env").exists():
+        return creds
+    # no recorded params: seed from flags (explicit env wins on the node side)
+    e = cloud_env(a); e.update(creds)
+    return e
+
+
 def cmd_cloud(a):
-    require_prod_mdp(a)
     folder = Path(a.folder).resolve()
+    if getattr(a, "resume", False):
+        if getattr(a, "dry_run", False):
+            sys.exit("--resume and --dry-run are mutually exclusive")
+        cloud_launch_then_supervise(["resume"], cloud_resume_env(a, folder), folder,
+                                    supervise=not a.no_supervise)
+        return
+    require_prod_mdp(a)
     if getattr(a, "dry_run", False):
         e = cloud_env(a); e["RENDER_ONLY"] = "1"
         sh(["bash", RUNNER, "launch", str(folder)], env=e)   # validate spec + offer listing, no GPU rented
@@ -188,6 +276,7 @@ def cmd_extend(a):
             "TOTAL_NS": 0, "STAGE_NS": a.stage_ns, "CKPT_MIN": a.ckpt_min, "MAXH_PER_STAGE": a.maxh,
             "NT": a.nt, "GPU_ID": a.gpu_id, "GMX": "gmx",
             "EXTEND_BASE": base, "EXTEND_TO_PS": f"{target_ns * 1000.0:.6f}",
+            "WAIT_FOR_PULL": 0,   # no local supervisor — don't block on PULLED_OK at the end
         }
         sh(["bash", folder / "run_pipeline.sh"], env=env, cwd=folder)
         if not a.skip_analysis:
@@ -250,6 +339,10 @@ def add_cloud_flags(sp):
     sp.add_argument("--pushover-device", default=None)
     sp.add_argument("--no-supervise", action="store_true", help="provision + start only (advanced)")
     sp.add_argument("--dry-run", action="store_true", help="validate spec + list offers, rent NOTHING ($0)")
+    sp.add_argument("--resume", action="store_true",
+                    help="resume an interrupted run from the local .cloud_state checkpoint "
+                         "(fresh node, same cluster). Reuses the original launch's mdps + "
+                         "settings — no need to re-pass --prod-mdp/--analysis/etc.")
 
 
 def build_parser():
@@ -262,6 +355,9 @@ def build_parser():
     sp.add_argument("--nt", type=int, default=None, help="OpenMP threads (default: all cores)")
     sp.add_argument("--gpu-id", type=int, default=0)
     sp.add_argument("--skip-analysis", action="store_true")
+    sp.add_argument("--fresh", action="store_true",
+                    help="wipe prior run outputs in the folder and start over "
+                         "(default: auto-resume from existing checkpoints)")
     sp.set_defaults(func=cmd_local)
 
     sp = sub.add_parser("cloud", help="run on a rented Vast.ai GPU")
@@ -296,7 +392,7 @@ def build_parser():
 
     sp = sub.add_parser("poc", help="cheap proof of the cloud path")
     sp.add_argument("mode", nargs="?", default="dryrun",
-                    choices=["dryrun", "happy", "resume", "extend", "all"])
+                    choices=["dryrun", "happy", "resume", "expire", "extend", "all"])
     sp.set_defaults(func=cmd_poc)
     return p
 

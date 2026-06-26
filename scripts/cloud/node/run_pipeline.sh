@@ -101,6 +101,14 @@ clear_mark(){ rm -f "$STATUS_DIR/$1" 2>/dev/null || true; }
 # This is the core guarantee that no trajectory dies on the node before it is
 # safely on the local store. The supervisor sky-down's the node on success.
 wait_for_pull() {
+  # LOCAL runs (mda local / mda extend --where local) have NO supervisor to write
+  # status/PULLED_OK, so without this guard a finished local run would block here for
+  # the full KEEPALIVE_MAXH (hours) before the CLI's analysis step ever runs. The CLI
+  # sets WAIT_FOR_PULL=0 for local; cloud leaves it 1 (default) so the keepalive holds.
+  if [ "${WAIT_FOR_PULL:-1}" != "1" ]; then
+    echo "[node] WAIT_FOR_PULL=0 (local/unsupervised) — not holding for a pull; continuing."
+    return 0
+  fi
   local maxs=$(( KEEPALIVE_MAXH * 3600 )) t=0
   echo "[node] outputs complete — holding instance up for the supervisor's verified pull"
   echo "[node]   (waiting for status/PULLED_OK, billing cap ${KEEPALIVE_MAXH}h)"

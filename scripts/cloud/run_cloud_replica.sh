@@ -41,6 +41,15 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 PREP="$(cd "$HERE/.." && pwd)"           # replica_prep/
 [ -f "$HERE/cloud.env" ] && source "$HERE/cloud.env"
 
+# Snapshot the RAW environment for params that may be RESTORED from a run's persisted
+# launch file (.cloud_run/run_params.env) on resume / re-attach / cron-watchdog. Precedence
+# we want is: explicit env > persisted file > built-in default. After the `${VAR:-default}`
+# block below we can no longer tell "user set 750" from "default 750", so capture the raw
+# env NOW (empty string = the user did not set it). apply_run_params() consumes these.
+for _v in TOTAL_NS STAGE_NS SYNC_MIN CKPT_MIN MAXH_PER_STAGE MAX_RESTARTS KEEPALIVE_MAXH ANALYSIS DRY_GROUP DISK_FACTOR; do
+  eval "_ENV_${_v}=\${${_v}:-}"
+done
+
 SKY="${SKY:-sky}"; VASTAI="${VASTAI:-vastai}"; PY="$(command -v python3 || echo python3)"
 IMAGE="${IMAGE:-nvidia/cuda:12.4.1-runtime-ubuntu22.04}"
 IMAGE_KIND="${IMAGE_KIND:-conda}"
@@ -68,6 +77,9 @@ NT="${NT:-}"                                   # OpenMP thread ceiling on the no
 AUTOTUNE="${AUTOTUNE:-1}"                       # benchmark mdrun flags per node before production
 BENCH_STEPS="${BENCH_STEPS:-4000}"
 PULL_RETRIES="${PULL_RETRIES:-6}"             # verified-pull attempts before giving up
+UNKNOWN_MAX="${UNKNOWN_MAX:-6}"               # consecutive Vast-API-unknown checks (while unreachable)
+                                              # tolerated before forcing a recovery relaunch from the
+                                              # local checkpoint (≈ UNKNOWN_MAX × SYNC_MIN minutes)
 FORCE="${FORCE:-0}"                           # FORCE=1 bypasses the pull-before-destroy guards
 # DISK_GB: floor it to the solvated run size (~0.45 GB/ns for ~90k-atom boxes) so
 # the node can't fill mid-run; a larger user override still wins.
@@ -123,6 +135,42 @@ jobname_of() {
 persist_jobname() {  # $1=REPLICA_DIR  $2=JOB
   mkdir -p "$1/.cloud_run" 2>/dev/null || true
   printf '%s' "$2" > "$1/.cloud_run/JOBNAME" 2>/dev/null || true
+}
+
+# Record the run's resolved knobs at launch so `resume` and a re-attached/cron
+# `supervise` reuse them WITHOUT the user re-passing --prod-mdp/--analysis/etc. The
+# mdps themselves are already staged in .cloud_run/mdp/; this captures the supervisor-
+# and analysis-side parameters (node-side TOTAL_NS/STAGE_NS are also baked in the
+# rendered YAML). Sourced by cmd_supervise/cmd_resume.
+persist_run_params() {  # $1=REPLICA_DIR
+  local STAGE; STAGE="$(stage_dir "$1")"; mkdir -p "$STAGE" 2>/dev/null || true
+  { echo "# launch params (auto-written); sourced on resume/re-attach so they need not be re-passed."
+    echo "TOTAL_NS=$TOTAL_NS"
+    echo "STAGE_NS=$STAGE_NS"
+    echo "SYNC_MIN=$SYNC_MIN"
+    echo "CKPT_MIN=$CKPT_MIN"
+    echo "MAXH_PER_STAGE=$MAXH_PER_STAGE"
+    echo "MAX_RESTARTS=$MAX_RESTARTS"
+    echo "KEEPALIVE_MAXH=$KEEPALIVE_MAXH"
+    echo "ANALYSIS=\"$ANALYSIS\""
+    echo "DRY_GROUP=\"$DRY_GROUP\""
+    echo "DISK_FACTOR=\"$DISK_FACTOR\""
+  } > "$STAGE/run_params.env" 2>/dev/null || true
+}
+
+# Resolve params on resume / re-attach: file fills gaps, but an explicit env (snapshot
+# in _ENV_*) still wins, and our built-in defaults lose to the file. Call at the start of
+# cmd_resume/cmd_supervise so a supervisor spawned without the original env still gets the
+# right run shape (N_STAGES/cadence/analysis) instead of silently defaulting to 750/50.
+apply_run_params() {  # $1=STAGE
+  local STAGE="$1" _v
+  # shellcheck disable=SC1090
+  [ -f "$STAGE/run_params.env" ] && source "$STAGE/run_params.env"
+  for _v in TOTAL_NS STAGE_NS SYNC_MIN CKPT_MIN MAXH_PER_STAGE MAX_RESTARTS KEEPALIVE_MAXH ANALYSIS DRY_GROUP DISK_FACTOR; do
+    eval "[ -n \"\${_ENV_${_v}}\" ] && ${_v}=\"\${_ENV_${_v}}\""
+  done
+  TOTAL_NS=$(awk -v v="$TOTAL_NS" 'BEGIN{n=int(v+0); if(n<1)n=1; printf "%d", n}')
+  STAGE_NS=$(awk -v v="$STAGE_NS" 'BEGIN{n=int(v+0); if(n<1)n=1; printf "%d", n}')
 }
 
 stage_dir() { echo "$1/.cloud_run"; }
@@ -482,12 +530,51 @@ pull_verified() {
   [ "$reachable" -eq 1 ] && return 1 || return 2   # 1=reachable-but-incomplete, 2=never reachable
 }
 
-# Is this job's Vast instance present?  0=present, 1=confirmed absent, 2=unknown (API error).
+# Classify this job's Vast instance by LIFECYCLE STATE, not just label presence.
+# Echoes one of: "running" | "stopped:<state>" | "absent" | "err".
+# WHY this exists: a Vast rental that EXPIRES (reserved-time/max-duration reached, or
+# host reclaim) does NOT vanish from `vastai show instances` — it lingers as an
+# exited/stopped/created record that STILL carries the "<job>-...-head" label. A bare
+# label match (vast_desc) therefore reads an expired node as "present", and the
+# supervisor's data-safety guard then refuses to relaunch FOREVER (the exact bug that
+# stranded a 920 ns run: Pushover kept firing "present but unreachable", no recovery).
+# Only "running" is a usable node; anything else listed is operationally DEAD and must
+# trigger recovery (we have already pulled what we could; resume from the local cpt).
+instance_status() {
+  local raw rc
+  set +e; raw="$("$VASTAI" show instances --raw 2>/dev/null)"; rc=$?; set -e
+  if [ "$rc" -ne 0 ] || [ -z "$raw" ]; then echo "err"; return 0; fi
+  printf '%s' "$raw" | python3 -c '
+import sys, json
+job = sys.argv[1]
+try: data = json.load(sys.stdin)
+except Exception:
+    print("err"); sys.exit(0)
+out = "absent"
+for o in (data or []):
+    lab = str(o.get("label") or "")
+    if lab.startswith(job + "-") and lab.endswith("-head"):
+        # Vast fields vary by API version; consult them all and take the first set.
+        st = ""
+        for k in ("actual_status", "cur_state", "intended_status", "status"):
+            v = o.get(k)
+            if v: st = str(v).lower(); break
+        out = "running" if st == "running" else ("stopped:" + (st or "unknown"))
+        break
+print(out)
+' "$1" 2>/dev/null || echo "err"
+}
+
+# Is this job's Vast instance present AND usable?
+#   0=present & running, 1=confirmed absent, 2=unknown (API error),
+#   3=present but NOT running (expired/stopped/exited — treat as dead → relaunch).
 instance_present() {
-  case "$(vast_desc "$1")" in
-    vast#ERR) return 2 ;;
-    vast#\?)  return 1 ;;
-    *)        return 0 ;;
+  case "$(instance_status "$1")" in
+    running)   return 0 ;;
+    absent)    return 1 ;;
+    err)       return 2 ;;
+    stopped:*) return 3 ;;
+    *)         return 2 ;;
   esac
 }
 
@@ -577,6 +664,11 @@ restage_state() {
            "$STORE"/md_part*.gro "$STORE"/md_ext*.gro; do
     [ -e "$f" ] && cp -pf "$f" "$STAGE/"
   done
+  # Carry the per-node mdrun tune forward so a recovered node reuses the benchmarked
+  # winner (load_tuned reads status/TUNED) instead of burning bench time re-tuning.
+  if [ -f "$STORE/status/TUNED" ]; then
+    mkdir -p "$STAGE/status" && cp -pf "$STORE/status/TUNED" "$STAGE/status/TUNED" 2>/dev/null || true
+  fi
   return 0   # globs that match nothing must not trip `set -e`
 }
 
@@ -647,10 +739,19 @@ cmd_launch() {
   echo "   estimated ~\$$SEL_EST_TOTAL over ~$SEL_EST_DAYS days for $TOTAL_NS ns"
 
   local STORE; STORE="$(store_dir "$REPLICA_DIR")"
+  # If an interrupted run's checkpoint is sitting here, point the user at `--resume`
+  # (which continues it on a fresh node) before we start over.
+  if { [ -f "$STORE/status/STARTED" ] || ls "$STORE"/*.cpt >/dev/null 2>&1; } \
+     && [ ! -f "$STORE/status/ALL_DONE" ] && [ ! -f "$REPLICA_DIR/prod_dry.xtc" ]; then
+    echo ">> NOTE: an interrupted run's checkpoint exists in $STORE."
+    echo "         To CONTINUE it on a fresh node (no need to re-pass mdps/flags), use:  mda cloud --resume"
+    echo "         Proceeding FRESH (your prior chunks are preserved, moved aside if un-analyzed)."
+  fi
   safe_reset_store "$STORE"            # fresh run, but never delete un-analyzed chunks
   stage_workdir "$REPLICA_DIR"
   persist_jobname "$REPLICA_DIR" "$JOB"   # lock the cluster name so all subcommands agree
   render_yaml "$REPLICA_DIR"
+  persist_run_params "$REPLICA_DIR"       # record mdps/flags so `resume`/`supervise` reuse them
   say "Rendered job spec: $STAGE/gromacs_md.sky.yaml"
 
   if [ "${RENDER_ONLY:-0}" = "1" ]; then
@@ -778,6 +879,7 @@ cmd_extend() {
   stage_workdir "$REPLICA_DIR" extend
   persist_jobname "$REPLICA_DIR" "$JOB"
   render_yaml "$REPLICA_DIR"
+  persist_run_params "$REPLICA_DIR"     # so a resumed extension reuses these knobs
   { echo "EXTEND_BASE=\"$EXT_BASE\""
     echo "EXTEND_STAGES=$n_ext"
     echo "EXTEND_CURRENT_NS=$cur_ns"
@@ -825,6 +927,72 @@ cmd_extend() {
   echo "============================================================"
 }
 
+# ============================ resume ==========================================
+# Continue an interrupted run from the LOCAL checkpoint on a fresh node, REUSING the
+# original launch's staged mdps + params (no need to re-pass --prod-mdp/--analysis).
+# For when the automatic supervisor recovery couldn't run — e.g. the laptop was asleep
+# at expiry and no `watchdog` cron respawned the supervisor. (A live supervisor recovers
+# on its own via the dead-node path; this is the manual button.)
+cmd_resume() {
+  local REPLICA_DIR; REPLICA_DIR="$(resolve_dir "${1:-$PWD}")"
+  local TAG JOB STAGE STORE; TAG="$(tag_of "$REPLICA_DIR")"; JOB="$(jobname_of "$REPLICA_DIR")"
+  STAGE="$(stage_dir "$REPLICA_DIR")"; STORE="$(store_dir "$REPLICA_DIR")"
+  echo "Replica folder : $REPLICA_DIR"
+  echo "Resume job     : $JOB"
+  # Reuse the prior launch's staging (mdps + rendered spec) — that's what lets a resume
+  # skip --prod-mdp et al. If it's gone, we can't infer the run; ask for a fresh launch.
+  [ -f "$STAGE/gromacs_md.sky.yaml" ] || die "no prior launch staging at $STAGE (.cloud_run missing). Nothing to resume — start a fresh run (mda cloud --prod-mdp …)."
+  { [ -f "$STORE/status/STARTED" ] || ls "$STORE"/*.cpt >/dev/null 2>&1; } \
+    || die "no checkpoint in $STORE (status/STARTED or *.cpt) — nothing to resume."
+  if [ -f "$STORE/status/ALL_DONE" ] || [ -f "$REPLICA_DIR/prod_dry.xtc" ]; then
+    echo ">> run already complete (ALL_DONE / prod_dry.xtc present) — nothing to resume."; return 0
+  fi
+  # Restore the launch knobs so the supervisor + messages use the ORIGINAL run shape
+  # (explicit env still wins — e.g. resuming an OLDER run with no run_params.env, pass
+  # --total-ns/--stage-ns to seed them).
+  if [ -f "$STAGE/run_params.env" ]; then
+    apply_run_params "$STAGE"
+    echo ">> restored launch params: ${TOTAL_NS} ns / ${STAGE_NS} ns chunks · analysis=$ANALYSIS · sync ${SYNC_MIN}m"
+  else
+    apply_run_params "$STAGE"
+    echo ">> WARN: no $STAGE/run_params.env (older launch) — using ${TOTAL_NS} ns / ${STAGE_NS} ns / analysis=$ANALYSIS"
+    echo "         (if that's wrong, re-run with the original --total-ns/--stage-ns/--analysis)."
+  fi
+
+  say "Bootstrap (tools + Vast key)"
+  ensure_tools; ensure_vast_key
+  ensure_pushover
+  ensure_local_gmx
+
+  say "Resuming $JOB from the local checkpoint (fresh node, same cluster)"
+  "$SKY" down -y "$JOB" >/dev/null 2>&1 || true     # clear any stale/stopped cluster record first
+  destroy_this_job_instance "$JOB" || true          # and any lingering expired instance (no leak)
+  restage_state "$STORE" "$STAGE"                    # overlay saved .cpt/.tpr/.gro + status/TUNED
+  echo "   restaged: $(cd "$STAGE" && ls -1 *.cpt *.tpr 2>/dev/null | tr '\n' ' ')"
+  if ! ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run $AUTOSTOP_ARGS ); then
+    echo ">> resume launch failed — tearing down any partially-provisioned node for $JOB"
+    destroy_this_job_instance "$JOB" || true; "$SKY" down -y "$JOB" >/dev/null 2>&1 || true
+    die "resume launch failed — check the output above."
+  fi
+  local VAST_ID=""; refresh_vast_id "$JOB" || true
+  notify "Resuming $TAG on $JOB from local checkpoint (~$(progress_str "$STORE" "$(( TOTAL_NS / STAGE_NS ))" 0))" "$TAG ▶" 0
+
+  if [ "${LAUNCH_NO_SUPERVISE:-0}" = "1" ]; then
+    say "LAUNCH_NO_SUPERVISE=1 — node resuming; supervisor NOT spawned (caller drives it)."
+    return 0
+  fi
+  local SUPLOG SUPPID; SUPLOG="$(suplog_of "$REPLICA_DIR")"; SUPPID="$(suppid_of "$REPLICA_DIR")"
+  say "Spawning background supervisor (pull + recover + analyze + teardown)"
+  nohup bash "$0" supervise "$REPLICA_DIR" >/dev/null 2>&1 &
+  echo $! > "$SUPPID"
+  echo "============================================================"
+  echo " Resumed: $JOB   (supervisor PID $(cat "$SUPPID"))"
+  echo "   follow   : $0 follow $REPLICA_DIR"
+  echo "   status   : $0 status $REPLICA_DIR"
+  echo "   teardown : $0 teardown $REPLICA_DIR"
+  echo "============================================================"
+}
+
 # ============================ supervise =======================================
 # The durability + recovery loop. Pulls node state every SYNC_MIN, notifies on
 # new stages, recovers a dead node by relaunching with restaged state, and on
@@ -834,6 +1002,11 @@ cmd_supervise() {
   local TAG JOB STAGE STORE; TAG="$(tag_of "$REPLICA_DIR")"; JOB="$(jobname_of "$REPLICA_DIR")"
   STAGE="$(stage_dir "$REPLICA_DIR")"; STORE="$(store_dir "$REPLICA_DIR")"
   [ -f "$STAGE/gromacs_md.sky.yaml" ] || die "no rendered spec at $STAGE — run 'launch' first."
+  # Reuse the launch-time params (TOTAL_NS/STAGE_NS/SYNC_MIN/ANALYSIS/…) so a supervisor
+  # spawned WITHOUT the original env — a `--resume`, a cron `watchdog` respawn, or a manual
+  # re-attach — computes the right N_STAGES/cadence/analysis instead of falling back to
+  # defaults (750/50) and mis-detecting completion. Explicit env still wins (apply_run_params).
+  apply_run_params "$STAGE"
   mkdir -p "$STORE" "$STORE/status"   # status/ may not be pulled yet; keep find/globs from erroring on a missing dir
   local SUPPID SUPLOG; SUPPID="$(suppid_of "$REPLICA_DIR")"; SUPLOG="$(suplog_of "$REPLICA_DIR")"
   # Single-supervisor lock: if a LIVE supervisor other than us already owns this run,
@@ -866,13 +1039,13 @@ cmd_supervise() {
     MODE="extend"; N_STAGES="${EXTEND_STAGES:-$N_STAGES}"; NS_BASE="${EXTEND_CURRENT_NS:-0}"; STAGE_WORD="extension"
     echo "[$(date '+%F %T')] mode=EXTEND base=${EXTEND_BASE:-?} from ${NS_BASE} ns in ${N_STAGES} x ${STAGE_NS} ns chunks"
   fi
-  local restarts=0 fails=0 last_prod=0 em_done=0 nvt_done=0 npt_done=0 first_pull=1 nprod VAST_ID="" gone_confirm=0 relaunch_grace=0
+  local restarts=0 fails=0 last_prod=0 em_done=0 nvt_done=0 npt_done=0 first_pull=1 nprod VAST_ID="" gone_confirm=0 relaunch_grace=0 api_unknown=0
   while true; do
     # resolve (or re-resolve after a recovery) the Vast instance id for messages
     if [ -z "$VAST_ID" ] || [ "$VAST_ID" = "vast#?" ]; then refresh_vast_id "$JOB"; fi
     reap_duplicate_instances "$JOB"   # clean up any SkyPilot failover-leaked duplicate node
     if pull_state "$JOB" "$STORE"; then
-      fails=0
+      fails=0; gone_confirm=0; api_unknown=0   # a healthy pull clears any in-flight death suspicion
       nprod=$( { find "$STORE/status" -maxdepth 1 -name 'PROD_*_DONE' 2>/dev/null || true; } | wc -l | tr -d ' ')
       if [ "$first_pull" = 1 ]; then
         # Baseline: record what is already done WITHOUT notifying, so a (re)attach
@@ -897,6 +1070,10 @@ cmd_supervise() {
         if [ "$nprod" -gt "$last_prod" ]; then
           local ns_now; ns_now=$(awk -v b="$NS_BASE" -v k="$nprod" -v s="$STAGE_NS" 'BEGIN{printf "%g", b + k*s}')
           notify "$TAG: ${STAGE_WORD} chunk ${nprod}/${N_STAGES} done (~${ns_now} ns total) — $(progress_str "$STORE" "$N_STAGES" 0 "$MODE")" "$TAG ⏱" 0
+          # Real forward progress earns a fresh recovery budget: a node that produced a new
+          # chunk has clearly recovered from any earlier setup churn, so don't let those
+          # early restarts pre-exhaust MAX_RESTARTS for a legitimate late expiry.
+          restarts=0
         fi
         last_prod="$nprod"
       fi
@@ -1009,28 +1186,54 @@ cmd_supervise() {
         # pvrc=2: unreachable across all probe retries. Consult the Vast API.
         if instance_present "$JOB"; then iprc=0; else iprc=$?; fi
         if [ "$iprc" -eq 0 ]; then
-          gone_confirm=0
-          notify "$TAG ⚠ node unreachable but still PRESENT — NOT destroying (unpulled data may be on it)" "$TAG ⚠" 1
-          echo "[$(date '+%F %T')] instance present but unreachable; refusing teardown to avoid data loss"
+          gone_confirm=0; api_unknown=0
+          notify "$TAG ⚠ node RUNNING but unreachable — NOT destroying (unpulled data may be on it)" "$TAG ⚠" 1
+          echo "[$(date '+%F %T')] instance running but unreachable; refusing teardown to avoid data loss"
         elif [ "$iprc" -eq 2 ]; then
-          gone_confirm=0
-          notify "$TAG ⚠ Vast API unreachable — cannot confirm node state; NOT destroying" "$TAG ⚠" 1
-          echo "[$(date '+%F %T')] Vast API error — node state UNKNOWN; refusing teardown, retry next cycle"
+          # Vast API gave us nothing. Normally we wait it out — but an UNBOUNDED wait is
+          # its own "notifies forever, never recovers" trap if the API stays down while
+          # the node is actually gone. Be patient, then escalate to a relaunch (the local
+          # checkpoint is safe; a node we can neither reach NOR query for this long is
+          # effectively dead). UNKNOWN_MAX cycles ≈ UNKNOWN_MAX × SYNC_MIN minutes.
+          api_unknown=$((api_unknown+1)); gone_confirm=0
+          if [ "$api_unknown" -lt "$UNKNOWN_MAX" ]; then
+            notify "$TAG ⚠ Vast API unreachable ($api_unknown/$UNKNOWN_MAX) — cannot confirm node; NOT destroying yet" "$TAG ⚠" 1
+            echo "[$(date '+%F %T')] Vast API error; node state UNKNOWN ($api_unknown/$UNKNOWN_MAX) — refusing teardown, retry next cycle"
+          elif [ "$restarts" -ge "$MAX_RESTARTS" ]; then
+            notify "$TAG ❌ node unreachable + API unknown too long and max restarts ($MAX_RESTARTS) exhausted" "$TAG ❌" 1
+            die "exhausted $MAX_RESTARTS restarts; giving up. Inspect: $SKY status ; vastai show instances"
+          else
+            api_unknown=0; restarts=$((restarts+1))
+            notify "$TAG ↻ node unreachable + API unknown for ${UNKNOWN_MAX} checks — recovering from local checkpoint (restart $restarts/$MAX_RESTARTS)" "$TAG ↻" 1
+            echo "[$(date '+%F %T')] API-unknown timeout: sky down + restage + relaunch ($restarts/$MAX_RESTARTS)"
+            "$SKY" down -y "$JOB" >/dev/null 2>&1 || true
+            VAST_ID=""; restage_state "$STORE" "$STAGE"
+            if ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run $AUTOSTOP_ARGS ); then
+              echo "[$(date '+%F %T')] relaunched $JOB; resuming pulls"; fails=0; relaunch_grace=3
+            else
+              echo "[$(date '+%F %T')] relaunch failed; will retry next cycle"
+            fi
+          fi
         else
-          # iprc=1: CONFIRMED absent. Require two consecutive confirmations before the
-          # destructive down+restage+relaunch (a single API gap must not trigger it).
+          # iprc=1 (no label match — destroyed) OR iprc=3 (label present but the rental is
+          # EXPIRED/stopped/exited — gone for our purposes, cannot SSH, will not resume on
+          # its own). Both mean "node is dead; relaunch from the local checkpoint." Require
+          # two consecutive confirmations before the destructive down+restage+relaunch (a
+          # single API gap must not trigger it).
+          api_unknown=0
+          local _why="gone"; [ "$iprc" -eq 3 ] && _why="EXPIRED/stopped"
           gone_confirm=$((gone_confirm+1))
           if [ "$gone_confirm" -lt 2 ]; then
-            echo "[$(date '+%F %T')] node appears GONE ($gone_confirm/2) — confirming once more before relaunch"
+            echo "[$(date '+%F %T')] node appears $_why ($gone_confirm/2) — confirming once more before relaunch"
           else
             gone_confirm=0
             if [ "$restarts" -ge "$MAX_RESTARTS" ]; then
-              notify "$TAG ❌ node gone and max restarts ($MAX_RESTARTS) exhausted" "$TAG ❌" 1
+              notify "$TAG ❌ node $_why and max restarts ($MAX_RESTARTS) exhausted" "$TAG ❌" 1
               die "exhausted $MAX_RESTARTS restarts; giving up. Inspect: $SKY status ; vastai show instances"
             fi
             restarts=$((restarts+1))
-            notify "$TAG ↻ node confirmed gone — recovering (restart $restarts/$MAX_RESTARTS)" "$TAG ↻" 1
-            echo "[$(date '+%F %T')] node confirmed gone: sky down + restage + relaunch ($restarts/$MAX_RESTARTS)"
+            notify "$TAG ↻ node confirmed $_why — recovering from local checkpoint (restart $restarts/$MAX_RESTARTS)" "$TAG ↻" 1
+            echo "[$(date '+%F %T')] node confirmed $_why: sky down + restage + relaunch ($restarts/$MAX_RESTARTS)"
             "$SKY" down -y "$JOB" >/dev/null 2>&1 || true
             VAST_ID=""; restage_state "$STORE" "$STAGE"
             if ( cd "$STAGE" && "$SKY" launch -c "$JOB" ./gromacs_md.sky.yaml -y --detach-run $AUTOSTOP_ARGS ); then
@@ -1086,7 +1289,14 @@ cmd_status() {
     elif [ -f "$STORE/status/STARTED" ]; then state="COMPUTING (equilibration)"
     else state="PROVISIONING / on-node GROMACS setup"; fi
   elif [ "$vd" = "vast#ERR" ]; then state="UNKNOWN (Vast API error — retry)"
-  elif [ "$vd" != "vast#?" ]; then state="node present but cluster not UP (stopping / recovering?)"
+  elif [ "$vd" != "vast#?" ]; then
+    # A node is listed. Distinguish a usable running node from an EXPIRED/stopped rental
+    # (the latter looks 'present' to a bare label match but the supervisor will relaunch it).
+    case "$(instance_status "$JOB")" in
+      running)   state="node present but cluster not UP (stopping / recovering?)" ;;
+      stopped:*) state="node EXPIRED/stopped — supervisor should relaunch from local checkpoint" ;;
+      *)         state="node present but cluster not UP (stopping / recovering?)" ;;
+    esac
   else state="DEAD / torn down (no node)"; fi
   echo "=== state ==="
   echo "  derived  : $state"
@@ -1178,15 +1388,19 @@ cmd_watchdog() {
 }
 
 # ============================ dispatch ========================================
+# Testability: `RUN_CLOUD_REPLICA_LIB=1 source run_cloud_replica.sh` loads the
+# functions WITHOUT executing a subcommand (used by the $0 unit tests).
+if [ "${RUN_CLOUD_REPLICA_LIB:-0}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
 SUB="${1:-launch}"; shift || true
 case "$SUB" in
   launch)    cmd_launch    "$@" ;;
   extend)    cmd_extend    "$@" ;;
+  resume)    cmd_resume    "$@" ;;
   supervise) cmd_supervise "$@" ;;
   watchdog)  cmd_watchdog  "$@" ;;
   follow)    cmd_follow    "$@" ;;
   status)    cmd_status    "$@" ;;
   fetch)     cmd_fetch     "$@" ;;
   teardown)  cmd_teardown  "$@" ;;
-  *) echo "usage: $0 {launch|extend|supervise|watchdog|follow|status|fetch|teardown} [REPLICA_DIR]"; echo "  extend: EXTEND_FROM=<base> EXTEND_TO_NS=<ns>|EXTEND_BY_NS=<ns> $0 extend [DIR]"; exit 1 ;;
+  *) echo "usage: $0 {launch|extend|resume|supervise|watchdog|follow|status|fetch|teardown} [REPLICA_DIR]"; echo "  extend: EXTEND_FROM=<base> EXTEND_TO_NS=<ns>|EXTEND_BY_NS=<ns> $0 extend [DIR]"; exit 1 ;;
 esac
